@@ -2,6 +2,29 @@
 
 ## [Unreleased]
 
+## [13.17.6] - 2026-04-01
+
+### Fixed
+
+- Fixed Anthropic first-event timeouts to exclude stream connection setup from the watchdog, preserve timeout-specific retry classification after local aborts, and reset retry state cleanly between attempts
+
+## [13.17.5] - 2026-04-01
+### Changed
+
+- Increased default first-event timeout from 15s to 45s to better accommodate longer request setup times
+- Modified first-event watchdog to inherit idle timeout when it exceeds the default, ensuring consistent timeout behavior across different configurations
+
+### Fixed
+
+- Fixed first-event watchdog initialization timing so it no longer starts before the actual stream request is created, preventing premature timeouts during request setup
+- Fixed first-event watchdog timing so OpenAI-family providers no longer count slow request setup against the first streamed event timeout, and raised the default first-event timeout to avoid false aborts after long tool turns
+
+## [13.17.2] - 2026-04-01
+
+### Fixed
+
+- Fixed OpenAI-family first-event timeouts to preserve provider-specific timeout errors for retry classification instead of flattening them to generic aborts ([#591](https://github.com/can1357/oh-my-pi/issues/591))
+
 ## [13.17.1] - 2026-04-01
 
 ### Added
