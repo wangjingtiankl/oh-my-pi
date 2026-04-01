@@ -632,8 +632,9 @@ function buildParams(
 
 	if (context.tools) {
 		params.tools = convertTools(context.tools, compat);
-	} else if (hasToolHistory(context.messages)) {
+	} else if (hasToolHistory(context.messages) && options?.toolChoice !== "none") {
 		// Anthropic (via LiteLLM/proxy) requires tools param when conversation has tool_calls/tool_results
+		// But don't send empty tools array when toolChoice is "none" - it causes 400 errors on some providers
 		params.tools = [];
 	}
 
