@@ -194,6 +194,15 @@ export const SETTINGS_SCHEMA = {
 	// ────────────────────────────────────────────────────────────────────────
 	lastChangelogVersion: { type: "string", default: undefined },
 
+	autoResume: {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "interaction",
+			label: "Auto Resume",
+			description: "Automatically resume the most recent session in the current directory",
+		},
+	},
 	shellPath: { type: "string", default: undefined },
 
 	extensions: { type: "array", default: EMPTY_STRING_ARRAY },
@@ -797,6 +806,38 @@ export const SETTINGS_SCHEMA = {
 
 	"compaction.remoteEndpoint": { type: "string", default: undefined },
 
+	// Idle compaction
+	"compaction.idleEnabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "context",
+			label: "Idle Compaction",
+			description: "Compact context while idle when token count exceeds threshold",
+		},
+	},
+
+	"compaction.idleThresholdTokens": {
+		type: "number",
+		default: 200000,
+		ui: {
+			tab: "context",
+			label: "Idle Compaction Threshold",
+			description: "Token count above which idle compaction triggers",
+			submenu: true,
+		},
+	},
+
+	"compaction.idleTimeoutSeconds": {
+		type: "number",
+		default: 300,
+		ui: {
+			tab: "context",
+			label: "Idle Compaction Delay",
+			description: "Seconds to wait while idle before compacting",
+			submenu: true,
+		},
+	},
 	// Branch summaries
 	"branchSummary.enabled": {
 		type: "boolean",
@@ -908,12 +949,12 @@ export const SETTINGS_SCHEMA = {
 	// Edit tool
 	"edit.mode": {
 		type: "enum",
-		values: ["replace", "patch", "hashline"] as const,
+		values: ["replace", "patch", "hashline", "chunk"] as const,
 		default: "hashline",
 		ui: {
 			tab: "editing",
 			label: "Edit Mode",
-			description: "Select the edit tool variant (replace, patch, or hashline)",
+			description: "Select the edit tool variant (replace, patch, hashline, or chunk)",
 		},
 	},
 
@@ -1207,7 +1248,7 @@ export const SETTINGS_SCHEMA = {
 	"fetch.enabled": {
 		type: "boolean",
 		default: true,
-		ui: { tab: "tools", label: "Fetch", description: "Enable the fetch tool for URL fetching" },
+		ui: { tab: "tools", label: "Read URLs", description: "Allow the read tool to fetch and process URLs" },
 	},
 
 	"github.enabled": {
@@ -1701,6 +1742,9 @@ export interface CompactionSettings {
 	autoContinue: boolean;
 	remoteEnabled: boolean;
 	remoteEndpoint: string | undefined;
+	idleEnabled: boolean;
+	idleThresholdTokens: number;
+	idleTimeoutSeconds: number;
 }
 
 export interface ContextPromotionSettings {

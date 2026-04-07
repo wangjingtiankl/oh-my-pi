@@ -1,7 +1,7 @@
 {
 	"type": "module",
 	"name": "@oh-my-pi/pi-natives",
-	"version": "13.17.6",
+	"version": "13.19.0",
 	"description": "Native Rust bindings for grep, clipboard, image processing, syntax highlighting, PTY, and shell operations via N-API",
 	"homepage": "https://github.com/can1357/oh-my-pi",
 	"author": "Can Boluk",
@@ -83,6 +83,14 @@
 		"./clipboard/*": {
 			"types": "./src/clipboard/*.ts",
 			"import": "./src/clipboard/*.ts"
+		},
+		"./chunk": {
+			"types": "./src/chunk/index.ts",
+			"import": "./src/chunk/index.ts"
+		},
+		"./chunk/*": {
+			"types": "./src/chunk/*.ts",
+			"import": "./src/chunk/*.ts"
 		},
 		"./glob": {
 			"types": "./src/glob/index.ts",

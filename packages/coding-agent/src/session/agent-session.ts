@@ -23,7 +23,6 @@ import {
 	type AgentMessage,
 	type AgentState,
 	type AgentTool,
-	INTENT_FIELD,
 	ThinkingLevel,
 } from "@oh-my-pi/pi-agent-core";
 import type {
@@ -59,6 +58,7 @@ import {
 	extractExplicitThinkingSelector,
 	formatModelString,
 	parseModelString,
+	type ResolvedModelRoleValue,
 	resolveModelRoleValue,
 } from "../config/model-resolver";
 import { expandPromptTemplate, type PromptTemplate, renderPromptTemplate } from "../config/prompt-templates";
@@ -114,7 +114,7 @@ import planModeToolDecisionReminderPrompt from "../prompts/system/plan-mode-tool
 	type: "text",
 };
 import ttsrInterruptTemplate from "../prompts/system/ttsr-interrupt.md" with { type: "text" };
-import type { SecretObfuscator } from "../secrets/obfuscator";
+import { deobfuscateSessionContext, type SecretObfuscator } from "../secrets/obfuscator";
 import { resolveThinkingLevelForModel, toReasoningEffort } from "../thinking";
 import type { CheckpointState } from "../tools/checkpoint";
 import { outputMeta } from "../tools/output-meta";
@@ -140,16 +140,13 @@ import {
 import { DEFAULT_PRUNE_CONFIG, pruneToolOutputs } from "./compaction/pruning";
 import {
 	type BashExecutionMessage,
-	type BranchSummaryMessage,
-	bashExecutionToText,
 	type CompactionSummaryMessage,
 	type CustomMessage,
 	convertToLlm,
 	type FileMentionMessage,
-	type HookMessage,
 	type PythonExecutionMessage,
-	pythonExecutionToText,
 } from "./messages";
+import { formatSessionDumpText } from "./session-dump-format";
 import type {
 	BranchSummaryEntry,
 	CompactionEntry,
@@ -162,7 +159,7 @@ import { getLatestCompactionEntry } from "./session-manager";
 /** Session-specific events that extend the core AgentEvent */
 export type AgentSessionEvent =
 	| AgentEvent
-	| { type: "auto_compaction_start"; reason: "threshold" | "overflow"; action: "context-full" | "handoff" }
+	| { type: "auto_compaction_start"; reason: "threshold" | "overflow" | "idle"; action: "context-full" | "handoff" }
 	| {
 			type: "auto_compaction_end";
 			action: "context-full" | "handoff";
@@ -539,7 +536,7 @@ export class AgentSession {
 		this.#defaultSelectedMCPServerNames = new Set(config.defaultSelectedMCPServerNames ?? []);
 		this.#defaultSelectedMCPToolNames = new Set(config.defaultSelectedMCPToolNames ?? []);
 		this.#pruneSelectedMCPToolNames();
-		const persistedSelectedMCPToolNames = this.sessionManager.buildSessionContext().selectedMCPToolNames;
+		const persistedSelectedMCPToolNames = this.buildDisplaySessionContext().selectedMCPToolNames;
 		const currentSelectedMCPToolNames = this.getSelectedMCPToolNames();
 		const persistInitialMCPToolSelection =
 			config.persistInitialMCPToolSelection ?? this.sessionManager.getBranch().length === 0;
@@ -668,7 +665,22 @@ export class AgentSession {
 			}
 		}
 
-		await this.#emitSessionEvent(event);
+		// Deobfuscate assistant message content for display emission — the LLM echoes back
+		// obfuscated placeholders, but listeners (TUI, extensions, exporters) must see real
+		// values. The original event.message stays obfuscated so the persistence path below
+		// writes `#HASH#` tokens to the session file; convertToLlm re-obfuscates outbound
+		// traffic on the next turn. Walks text, thinking, and toolCall arguments/intent.
+		let displayEvent: AgentEvent = event;
+		const obfuscator = this.#obfuscator;
+		if (obfuscator && event.type === "message_end" && event.message.role === "assistant") {
+			const message = event.message;
+			const deobfuscatedContent = obfuscator.deobfuscateObject(message.content);
+			if (deobfuscatedContent !== message.content) {
+				displayEvent = { ...event, message: { ...message, content: deobfuscatedContent } };
+			}
+		}
+
+		await this.#emitSessionEvent(displayEvent);
 
 		if (event.type === "turn_start") {
 			this.#resetStreamingEditState();
@@ -1968,7 +1980,7 @@ export class AgentSession {
 
 		this.#setDiscoverableMCPTools(this.#collectDiscoverableMCPToolsFromRegistry());
 		this.#pruneSelectedMCPToolNames();
-		if (!this.sessionManager.buildSessionContext().hasPersistedMCPToolSelection) {
+		if (!this.buildDisplaySessionContext().hasPersistedMCPToolSelection) {
 			this.#selectedMCPToolNames = new Set([
 				...this.#selectedMCPToolNames,
 				...this.#getConfiguredDefaultSelectedMCPToolNames(),
@@ -1991,6 +2003,10 @@ export class AgentSession {
 	/** All messages including custom types like BashExecutionMessage */
 	get messages(): AgentMessage[] {
 		return this.agent.state.messages;
+	}
+
+	buildDisplaySessionContext(): SessionContext {
+		return deobfuscateSessionContext(this.sessionManager.buildSessionContext(), this.#obfuscator);
 	}
 
 	/** Convert session messages using the same pre-LLM pipeline as the active session. */
@@ -2103,7 +2119,16 @@ export class AgentSession {
 	}
 
 	resolveRoleModel(role: string): Model | undefined {
-		return this.#resolveRoleModel(role, this.#modelRegistry.getAvailable(), this.model);
+		return this.#resolveRoleModelFull(role, this.#modelRegistry.getAvailable(), this.model).model;
+	}
+
+	/**
+	 * Resolve a role to its model AND thinking level.
+	 * Unlike resolveRoleModel(), this preserves the thinking level suffix
+	 * from role configuration (e.g., "anthropic/claude-sonnet-4-5:xhigh").
+	 */
+	resolveRoleModelWithThinking(role: string): ResolvedModelRoleValue {
+		return this.#resolveRoleModelFull(role, this.#modelRegistry.getAvailable(), this.model);
 	}
 
 	get promptTemplates(): ReadonlyArray<PromptTemplate> {
@@ -3182,7 +3207,7 @@ export class AgentSession {
 	 * Validates API key, saves to session log but NOT to settings.
 	 * @throws Error if no API key available for the model
 	 */
-	async setModelTemporary(model: Model): Promise<void> {
+	async setModelTemporary(model: Model, thinkingLevel?: ThinkingLevel): Promise<void> {
 		const apiKey = await this.#modelRegistry.getApiKey(model, this.sessionId);
 		if (!apiKey) {
 			throw new Error(`No API key for ${model.provider}/${model.id}`);
@@ -3193,8 +3218,8 @@ export class AgentSession {
 		this.sessionManager.appendModelChange(`${model.provider}/${model.id}`, "temporary");
 		this.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
 
-		// Re-apply the current thinking level for the newly selected model
-		this.setThinkingLevel(this.thinkingLevel);
+		// Apply explicit thinking level, or re-clamp current level to new model's capabilities
+		this.setThinkingLevel(thinkingLevel ?? this.thinkingLevel);
 	}
 
 	/**
@@ -3267,13 +3292,12 @@ export class AgentSession {
 		const next = roleModels[nextIndex];
 
 		if (options?.temporary) {
-			await this.setModelTemporary(next.model);
+			await this.setModelTemporary(next.model, next.explicitThinkingLevel ? next.thinkingLevel : undefined);
 		} else {
 			await this.setModel(next.model, next.role);
-		}
-
-		if (next.explicitThinkingLevel && next.thinkingLevel !== undefined) {
-			this.setThinkingLevel(next.thinkingLevel);
+			if (next.explicitThinkingLevel && next.thinkingLevel !== undefined) {
+				this.setThinkingLevel(next.thinkingLevel);
+			}
 		}
 
 		return { model: next.model, thinkingLevel: this.thinkingLevel, role: next.role };
@@ -3473,7 +3497,7 @@ export class AgentSession {
 		}
 
 		await this.sessionManager.rewriteEntries();
-		const sessionContext = this.sessionManager.buildSessionContext();
+		const sessionContext = this.buildDisplaySessionContext();
 		this.agent.replaceMessages(sessionContext.messages);
 		this.#syncTodoPhasesFromBranch();
 		this.#closeCodexProviderSessionsForHistoryRewrite();
@@ -3599,7 +3623,7 @@ export class AgentSession {
 				preserveData,
 			);
 			const newEntries = this.sessionManager.getEntries();
-			const sessionContext = this.sessionManager.buildSessionContext();
+			const sessionContext = this.buildDisplaySessionContext();
 			this.agent.replaceMessages(sessionContext.messages);
 			this.#syncTodoPhasesFromBranch();
 			this.#closeCodexProviderSessionsForHistoryRewrite();
@@ -3644,6 +3668,12 @@ export class AgentSession {
 		this.#compactionAbortController?.abort();
 		this.#autoCompactionAbortController?.abort();
 		this.#handoffAbortController?.abort();
+	}
+
+	/** Trigger idle compaction through the auto-compaction flow (with UI events). */
+	async runIdleCompaction(): Promise<void> {
+		if (this.isStreaming || this.isCompacting) return;
+		await this.#runAutoCompaction("idle", false, true);
 	}
 
 	/**
@@ -3814,7 +3844,7 @@ export class AgentSession {
 			}
 
 			// Rebuild agent messages from session
-			const sessionContext = this.sessionManager.buildSessionContext();
+			const sessionContext = this.buildDisplaySessionContext();
 			this.agent.replaceMessages(sessionContext.messages);
 			this.#syncTodoPhasesFromBranch();
 
@@ -4364,19 +4394,25 @@ export class AgentSession {
 		return availableModels.find(m => m.provider === currentModel.provider && m.id === configuredTarget);
 	}
 
-	#resolveRoleModel(role: string, availableModels: Model[], currentModel: Model | undefined): Model | undefined {
+	#resolveRoleModelFull(
+		role: string,
+		availableModels: Model[],
+		currentModel: Model | undefined,
+	): ResolvedModelRoleValue {
 		const roleModelStr =
 			role === "default"
 				? (this.settings.getModelRole("default") ??
 					(currentModel ? `${currentModel.provider}/${currentModel.id}` : undefined))
 				: this.settings.getModelRole(role);
 
-		if (!roleModelStr) return undefined;
+		if (!roleModelStr) {
+			return { model: undefined, thinkingLevel: undefined, explicitThinkingLevel: false, warning: undefined };
+		}
 
 		return resolveModelRoleValue(roleModelStr, availableModels, {
 			settings: this.settings,
 			matchPreferences: { usageOrder: this.settings.getStorage()?.getModelUsageOrder() },
-		}).model;
+		});
 	}
 
 	#getCompactionModelCandidates(availableModels: Model[]): Model[] {
@@ -4393,7 +4429,7 @@ export class AgentSession {
 
 		const currentModel = this.model;
 		for (const role of MODEL_ROLE_IDS) {
-			addCandidate(this.#resolveRoleModel(role, availableModels, currentModel));
+			addCandidate(this.#resolveRoleModelFull(role, availableModels, currentModel).model);
 		}
 
 		const sortedByContext = [...availableModels].sort((a, b) => b.contextWindow - a.contextWindow);
@@ -4410,11 +4446,16 @@ export class AgentSession {
 	/**
 	 * Internal: Run auto-compaction with events.
 	 */
-	async #runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean, deferred = false): Promise<void> {
+	async #runAutoCompaction(
+		reason: "overflow" | "threshold" | "idle",
+		willRetry: boolean,
+		deferred = false,
+	): Promise<void> {
 		const compactionSettings = this.settings.getGroup("compaction");
-		if (!compactionSettings.enabled || compactionSettings.strategy === "off") return;
+		if (compactionSettings.strategy === "off") return;
+		if (reason !== "idle" && !compactionSettings.enabled) return;
 		const generation = this.#promptGeneration;
-		if (!deferred && reason !== "overflow" && compactionSettings.strategy === "handoff") {
+		if (!deferred && reason !== "overflow" && reason !== "idle" && compactionSettings.strategy === "handoff") {
 			this.#schedulePostPromptTask(
 				async signal => {
 					await Promise.resolve();
@@ -4689,7 +4730,7 @@ export class AgentSession {
 				preserveData,
 			);
 			const newEntries = this.sessionManager.getEntries();
-			const sessionContext = this.sessionManager.buildSessionContext();
+			const sessionContext = this.buildDisplaySessionContext();
 			this.agent.replaceMessages(sessionContext.messages);
 			this.#syncTodoPhasesFromBranch();
 			this.#closeCodexProviderSessionsForHistoryRewrite();
@@ -4717,7 +4758,7 @@ export class AgentSession {
 			};
 			await this.#emitSessionEvent({ type: "auto_compaction_end", action, result, aborted: false, willRetry });
 
-			if (!willRetry && compactionSettings.autoContinue !== false) {
+			if (!willRetry && reason !== "idle" && compactionSettings.autoContinue !== false) {
 				const continuePrompt = async () => {
 					await this.#promptWithMessage(
 						{
@@ -5516,7 +5557,7 @@ export class AgentSession {
 		// Flush pending writes before switching so restore snapshots reflect committed state.
 		await this.sessionManager.flush();
 		const previousSessionState = this.sessionManager.captureState();
-		const previousSessionContext = this.sessionManager.buildSessionContext();
+		const previousSessionContext = this.buildDisplaySessionContext();
 		// switchSession replaces these arrays wholesale during load/rollback, so retaining
 		// the existing message objects is sufficient and avoids structured-clone failures for
 		// extension/custom metadata that is valid to persist but not cloneable.
@@ -5545,7 +5586,7 @@ export class AgentSession {
 			await this.sessionManager.setSessionFile(sessionPath);
 			this.agent.sessionId = this.sessionManager.getSessionId();
 
-			const sessionContext = this.sessionManager.buildSessionContext();
+			const sessionContext = this.buildDisplaySessionContext();
 			const didReloadConversationChange =
 				!switchingToDifferentSession &&
 				this.#didSessionMessagesChange(previousSessionContext.messages, sessionContext.messages);
@@ -5711,7 +5752,7 @@ export class AgentSession {
 		this.agent.sessionId = this.sessionManager.getSessionId();
 
 		// Reload messages from entries (works for both file and in-memory mode)
-		const sessionContext = this.sessionManager.buildSessionContext();
+		const sessionContext = this.buildDisplaySessionContext();
 
 		await this.#restoreMCPSelectionsForSessionContext(sessionContext);
 
@@ -5882,7 +5923,7 @@ export class AgentSession {
 		}
 
 		// Update agent state
-		const sessionContext = this.sessionManager.buildSessionContext();
+		const sessionContext = this.buildDisplaySessionContext();
 		await this.#restoreMCPSelectionsForSessionContext(sessionContext);
 		this.agent.replaceMessages(sessionContext.messages);
 		this.#syncTodoPhasesFromBranch();
@@ -6156,176 +6197,13 @@ export class AgentSession {
 	 * Includes user messages, assistant text, thinking blocks, tool calls, and tool results.
 	 */
 	formatSessionAsText(): string {
-		const lines: string[] = [];
-
-		/** Serialize an object as XML parameter elements, one per key. */
-		function formatArgsAsXml(args: Record<string, unknown>, indent = "\t"): string {
-			const parts: string[] = [];
-			for (const [key, value] of Object.entries(args)) {
-				if (key === INTENT_FIELD) continue;
-				const text = typeof value === "string" ? value : JSON.stringify(value);
-				parts.push(`${indent}<parameter name="${key}">${text}</parameter>`);
-			}
-			return parts.join("\n");
-		}
-
-		// Include system prompt at the beginning
-		const systemPrompt = this.agent.state.systemPrompt;
-		if (systemPrompt) {
-			lines.push("## System Prompt\n");
-			lines.push(systemPrompt);
-			lines.push("\n");
-		}
-
-		// Include model and thinking level
-		const model = this.agent.state.model;
-		const thinkingLevel = this.#thinkingLevel;
-		lines.push("## Configuration\n");
-		lines.push(`Model: ${model ? `${model.provider}/${model.id}` : "(not selected)"}`);
-		lines.push(`Thinking Level: ${thinkingLevel}`);
-		lines.push("\n");
-
-		// Include available tools
-		const tools = this.agent.state.tools;
-
-		// Recursively strip all fields starting with 'TypeBox.' from an object
-		function stripTypeBoxFields(obj: any): any {
-			if (Array.isArray(obj)) {
-				return obj.map(stripTypeBoxFields);
-			}
-			if (obj && typeof obj === "object") {
-				const result: Record<string, any> = {};
-				for (const [k, v] of Object.entries(obj)) {
-					if (!k.startsWith("TypeBox.")) {
-						result[k] = stripTypeBoxFields(v);
-					}
-				}
-				return result;
-			}
-			return obj;
-		}
-
-		if (tools.length > 0) {
-			lines.push("## Available Tools\n");
-			for (const tool of tools) {
-				lines.push(`<tool name="${tool.name}">`);
-				lines.push(tool.description);
-				const parametersClean = stripTypeBoxFields(tool.parameters);
-				lines.push(`\nParameters:\n${formatArgsAsXml(parametersClean as Record<string, unknown>)}`);
-				lines.push("<" + "/tool>\n");
-			}
-			lines.push("\n");
-		}
-
-		for (const msg of this.messages) {
-			if (msg.role === "user" || msg.role === "developer") {
-				lines.push(msg.role === "developer" ? "## Developer\n" : "## User\n");
-				if (typeof msg.content === "string") {
-					lines.push(msg.content);
-				} else {
-					for (const c of msg.content) {
-						if (c.type === "text") {
-							lines.push(c.text);
-						} else if (c.type === "image") {
-							lines.push("[Image]");
-						}
-					}
-				}
-				lines.push("\n");
-			} else if (msg.role === "assistant") {
-				const assistantMsg = msg as AssistantMessage;
-				lines.push("## Assistant\n");
-
-				for (const c of assistantMsg.content) {
-					if (c.type === "text") {
-						lines.push(c.text);
-					} else if (c.type === "thinking") {
-						lines.push("<thinking>");
-						lines.push(c.thinking);
-						lines.push("</thinking>\n");
-					} else if (c.type === "toolCall") {
-						lines.push(`<invoke name="${c.name}">`);
-						if (c.arguments && typeof c.arguments === "object") {
-							lines.push(formatArgsAsXml(c.arguments as Record<string, unknown>));
-						}
-						lines.push("<" + "/invoke>\n");
-					}
-				}
-				lines.push("");
-			} else if (msg.role === "toolResult") {
-				lines.push(`### Tool Result: ${msg.toolName}`);
-				if (msg.isError) {
-					lines.push("(error)");
-				}
-				for (const c of msg.content) {
-					if (c.type === "text") {
-						lines.push("```");
-						lines.push(c.text);
-						lines.push("```");
-					} else if (c.type === "image") {
-						lines.push("[Image output]");
-					}
-				}
-				lines.push("");
-			} else if (msg.role === "bashExecution") {
-				const bashMsg = msg as BashExecutionMessage;
-				if (!bashMsg.excludeFromContext) {
-					lines.push("## Bash Execution\n");
-					lines.push(bashExecutionToText(bashMsg));
-					lines.push("\n");
-				}
-			} else if (msg.role === "pythonExecution") {
-				const pythonMsg = msg as PythonExecutionMessage;
-				if (!pythonMsg.excludeFromContext) {
-					lines.push("## Python Execution\n");
-					lines.push(pythonExecutionToText(pythonMsg));
-					lines.push("\n");
-				}
-			} else if (msg.role === "custom" || msg.role === "hookMessage") {
-				const customMsg = msg as CustomMessage | HookMessage;
-				lines.push(`## ${customMsg.customType}\n`);
-				if (typeof customMsg.content === "string") {
-					lines.push(customMsg.content);
-				} else {
-					for (const c of customMsg.content) {
-						if (c.type === "text") {
-							lines.push(c.text);
-						} else if (c.type === "image") {
-							lines.push("[Image]");
-						}
-					}
-				}
-				lines.push("\n");
-			} else if (msg.role === "branchSummary") {
-				const branchMsg = msg as BranchSummaryMessage;
-				lines.push("## Branch Summary\n");
-				lines.push(`(from branch: ${branchMsg.fromId})\n`);
-				lines.push(branchMsg.summary);
-				lines.push("\n");
-			} else if (msg.role === "compactionSummary") {
-				const compactMsg = msg as CompactionSummaryMessage;
-				lines.push("## Compaction Summary\n");
-				lines.push(`(${compactMsg.tokensBefore} tokens before compaction)\n`);
-				lines.push(compactMsg.summary);
-				lines.push("\n");
-			} else if (msg.role === "fileMention") {
-				const fileMsg = msg as FileMentionMessage;
-				lines.push("## File Mention\n");
-				for (const file of fileMsg.files) {
-					lines.push(`<file path="${file.path}">`);
-					if (file.content) {
-						lines.push(file.content);
-					}
-					if (file.image) {
-						lines.push("[Image attached]");
-					}
-					lines.push("</file>\n");
-				}
-				lines.push("\n");
-			}
-		}
-
-		return lines.join("\n").trim();
+		return formatSessionDumpText({
+			messages: this.messages,
+			systemPrompt: this.agent.state.systemPrompt,
+			model: this.agent.state.model,
+			thinkingLevel: this.#thinkingLevel,
+			tools: this.agent.state.tools,
+		});
 	}
 
 	/**
