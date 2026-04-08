@@ -656,7 +656,13 @@ function buildParams(
 		Reflect.set(params, "thinking", { type: options?.reasoning ? "enabled" : "disabled" });
 	} else if (compat.thinkingFormat === "qwen" && model.reasoning) {
 		// Qwen uses top-level enable_thinking: boolean
-		Reflect.set(params, "enable_thinking", !!options?.reasoning);
+		// Qwen/GLM models reject forced tool_choice (required or specific tool) in thinking mode.
+		// When tool_choice forces tool use, disable thinking to avoid API errors.
+		const forcedToolChoice =
+			params.tool_choice === "required" ||
+			(typeof params.tool_choice === "object" && params.tool_choice?.type === "function");
+		const enableThinking = forcedToolChoice ? false : !!options?.reasoning;
+		Reflect.set(params, "enable_thinking", enableThinking);
 	} else if (compat.thinkingFormat === "qwen-chat-template" && model.reasoning) {
 		Reflect.set(params, "chat_template_kwargs", { enable_thinking: !!options?.reasoning });
 	} else if (compat.thinkingFormat === "openrouter" && options?.reasoning && model.reasoning) {
