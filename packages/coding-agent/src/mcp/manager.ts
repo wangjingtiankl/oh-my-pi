@@ -78,6 +78,21 @@ function delay(ms: number): Promise<void> {
 	return Bun.sleep(ms);
 }
 
+/**
+ * Stable, total ordering on MCP tools by name.
+ *
+ * Anthropic prompt caching keys on byte-identical tool definitions: any reorder
+ * of the tools array invalidates the tools cache breakpoint and forces a full
+ * prefix rebuild on the next request. MCP servers connect/reconnect at arbitrary
+ * times, so the natural "insertion order" of `#tools` is non-deterministic.
+ * Sorting after every mutation makes the array bytes independent of connection
+ * sequence.
+ */
+export function sortMCPToolsByName<T extends { name: string }>(tools: T[]): T[] {
+	tools.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+	return tools;
+}
+
 export function resolveSubscriptionPostAction(
 	notificationsEnabled: boolean,
 	currentEpoch: number,
@@ -176,6 +191,33 @@ export class MCPManager {
 		}
 	}
 
+	#subscribeAndTrack(name: string, connection: MCPServerConnection, uris: string[], notificationEpoch: number): void {
+		void subscribeToResources(connection, uris)
+			.then(() => {
+				const action = resolveSubscriptionPostAction(
+					this.#notificationsEnabled,
+					this.#notificationsEpoch,
+					notificationEpoch,
+				);
+				if (action === "rollback") {
+					void unsubscribeFromResources(connection, uris).catch(error => {
+						logger.debug("Failed to rollback stale MCP resource subscription", {
+							path: `mcp:${name}`,
+							error,
+						});
+					});
+					return;
+				}
+				if (action === "ignore") {
+					return;
+				}
+				this.#subscribedResources.set(name, new Set(uris));
+			})
+			.catch(error => {
+				logger.debug("Failed to subscribe to MCP resources", { path: `mcp:${name}`, error });
+			});
+	}
+
 	setNotificationsEnabled(enabled: boolean): void {
 		const wasEnabled = this.#notificationsEnabled;
 		this.#notificationsEnabled = enabled;
@@ -189,30 +231,7 @@ export class MCPManager {
 			for (const [name, connection] of this.#connections) {
 				if (connection.capabilities.resources?.subscribe && connection.resources) {
 					const uris = connection.resources.map(r => r.uri);
-					void subscribeToResources(connection, uris)
-						.then(() => {
-							const action = resolveSubscriptionPostAction(
-								this.#notificationsEnabled,
-								this.#notificationsEpoch,
-								notificationEpoch,
-							);
-							if (action === "rollback") {
-								void unsubscribeFromResources(connection, uris).catch(error => {
-									logger.debug("Failed to rollback stale MCP resource subscription", {
-										path: `mcp:${name}`,
-										error,
-									});
-								});
-								return;
-							}
-							if (action === "ignore") {
-								return;
-							}
-							this.#subscribedResources.set(name, new Set(uris));
-						})
-						.catch(error => {
-							logger.debug("Failed to subscribe to MCP resources", { path: `mcp:${name}`, error });
-						});
+					this.#subscribeAndTrack(name, connection, uris, notificationEpoch);
 				}
 			}
 			return;
@@ -455,6 +474,10 @@ export class MCPManager {
 			}
 		}
 
+		// Stable sort by name so the order is independent of connection completion.
+		// See `sortMCPToolsByName` for the cache-stability rationale.
+		sortMCPToolsByName(allTools);
+
 		// Update cached tools
 		this.#tools = allTools;
 		allowBackgroundLogging = true;
@@ -468,8 +491,11 @@ export class MCPManager {
 	}
 
 	#replaceServerTools(name: string, tools: CustomTool<TSchema, MCPToolDetails>[]): void {
-		this.#tools = this.#tools.filter(t => !t.name.startsWith(`mcp_${name}_`));
+		this.#tools = this.#tools.filter(t => !t.name.startsWith(`mcp__${name}_`));
 		this.#tools.push(...tools);
+		// Stable sort by name so reconnect order does not perturb the array.
+		// See `sortMCPToolsByName` for the cache-stability rationale.
+		sortMCPToolsByName(this.#tools);
 	}
 
 	#triggerNotificationRefresh(serverName: string, kind: "tools" | "resources" | "prompts"): void {
@@ -640,8 +666,8 @@ export class MCPManager {
 		}
 
 		// Remove tools from this server and notify consumers
-		const hadTools = this.#tools.some(t => t.name.startsWith(`mcp_${name}_`));
-		this.#tools = this.#tools.filter(t => !t.name.startsWith(`mcp_${name}_`));
+		const hadTools = this.#tools.some(t => t.name.startsWith(`mcp__${name}_`));
+		this.#tools = this.#tools.filter(t => !t.name.startsWith(`mcp__${name}_`));
 		if (hadTools) this.#onToolsChanged?.(this.#tools);
 
 		// Notify prompt consumers so stale commands are cleared
@@ -830,30 +856,7 @@ export class MCPManager {
 				if (this.#notificationsEnabled && connection.capabilities.resources?.subscribe) {
 					const uris = resources.map(r => r.uri);
 					const notificationEpoch = this.#notificationsEpoch;
-					void subscribeToResources(connection, uris)
-						.then(() => {
-							const action = resolveSubscriptionPostAction(
-								this.#notificationsEnabled,
-								this.#notificationsEpoch,
-								notificationEpoch,
-							);
-							if (action === "rollback") {
-								void unsubscribeFromResources(connection, uris).catch(error => {
-									logger.debug("Failed to rollback stale MCP resource subscription", {
-										path: `mcp:${name}`,
-										error,
-									});
-								});
-								return;
-							}
-							if (action === "ignore") {
-								return;
-							}
-							this.#subscribedResources.set(name, new Set(uris));
-						})
-						.catch(error => {
-							logger.debug("Failed to subscribe to MCP resources", { path: `mcp:${name}`, error });
-						});
+					this.#subscribeAndTrack(name, connection, uris, notificationEpoch);
 				}
 			} catch (error) {
 				logger.debug("Failed to load MCP resources", { path: `mcp:${name}`, error });

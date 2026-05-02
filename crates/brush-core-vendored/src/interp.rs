@@ -2,6 +2,7 @@ use std::{
 	collections::VecDeque,
 	io::Write,
 	path::{Path, PathBuf},
+	sync::Arc,
 };
 
 use brush_parser::ast::{self, CommandPrefixOrSuffixItem};
@@ -62,6 +63,39 @@ struct PipelineExecutionContext<'a> {
 	process_group_id: Option<i32>,
 }
 
+/// Information about an expanded external command launch.
+pub struct ExternalCommandInfo<'a> {
+	/// Shell command name before path resolution.
+	pub command_name:    &'a str,
+	/// Resolved executable path used for the process launch.
+	pub executable_path: &'a str,
+	/// Expanded process arguments, excluding `argv[0]`.
+	pub args:            Vec<&'a str>,
+}
+
+/// Marker strings written around a launched command's output.
+#[derive(Clone)]
+pub struct ExternalCommandOutputMarkers {
+	/// Marker written immediately before the process is spawned.
+	pub start_marker:      String,
+	/// Prefix for the completion marker; the numeric exit code is inserted
+	/// between this prefix and [`Self::end_marker_suffix`].
+	pub end_marker_prefix: String,
+	/// Suffix for the completion marker.
+	pub end_marker_suffix: String,
+}
+
+/// Optional hook used by embedders that need to identify output boundaries
+/// for individual external command launches.
+pub trait ExternalCommandOutputMarker: Send + Sync {
+	/// Returns markers for this external command, or `None` to leave its
+	/// output unmarked.
+	fn markers_for_external_command(
+		&self,
+		info: ExternalCommandInfo<'_>,
+	) -> Option<ExternalCommandOutputMarkers>;
+}
+
 /// Parameters for execution.
 #[derive(Clone, Default)]
 pub struct ExecutionParameters {
@@ -71,9 +105,33 @@ pub struct ExecutionParameters {
 	pub process_group_policy: ProcessGroupPolicy,
 	/// Optional cancellation token shared with callers.
 	cancel_token:             Option<CancellationToken>,
+	/// Optional command-output marker hook.
+	command_output_marker:    Option<Arc<dyn ExternalCommandOutputMarker>>,
+	/// Whether command-output marking was disabled by shell syntax that can
+	/// consume or redirect command output.
+	command_output_disabled:  bool,
 }
 
 impl ExecutionParameters {
+	/// Assigns an external-command output marker hook for this execution.
+	pub fn set_command_output_marker(&mut self, marker: Arc<dyn ExternalCommandOutputMarker>) {
+		self.command_output_marker = Some(marker);
+		self.command_output_disabled = false;
+	}
+
+	/// Disables external-command output marking for this execution branch.
+	pub fn disable_command_output_marking(&mut self) {
+		self.command_output_disabled = true;
+	}
+
+	/// Returns the active output marker hook, if marking is still safe.
+	pub fn command_output_marker(&self) -> Option<&Arc<dyn ExternalCommandOutputMarker>> {
+		if self.command_output_disabled {
+			return None;
+		}
+		self.command_output_marker.as_ref()
+	}
+
 	/// Assigns a cancellation token for this execution.
 	pub fn set_cancel_token(&mut self, token: CancellationToken) {
 		self.cancel_token = Some(token);
@@ -270,10 +328,9 @@ impl Execute for ast::CompoundList {
 			let run_async = matches!(sep, ast::SeparatorOperator::Async);
 
 			if run_async {
-				// TODO: Reenable launching in child process?
-				// let job = spawn_ao_list_in_child(ao_list, shell, params).await?;
-
-				let job = spawn_ao_list_in_task(ao_list, shell, params);
+				let mut async_params = params.clone();
+				async_params.disable_command_output_marking();
+				let job = spawn_ao_list_as_job(ao_list, shell, &async_params).await?;
 				let job_formatted = job.to_pid_style_string();
 
 				if shell.options.interactive && !shell.is_subshell() {
@@ -295,11 +352,92 @@ impl Execute for ast::CompoundList {
 	}
 }
 
-fn spawn_ao_list_in_task<'a>(
+async fn spawn_ao_list_as_job<'a>(
 	ao_list: &ast::AndOrList,
 	shell: &'a mut Shell,
 	params: &ExecutionParameters,
-) -> &'a jobs::Job {
+) -> Result<&'a jobs::Job, error::Error> {
+	let job = if should_try_spawn_pipeline_as_job(ao_list, shell, params).await? {
+		try_spawn_pipeline_as_job(&ao_list.first, ao_list.to_string(), shell, params)
+			.await?
+			.unwrap_or_else(|| spawn_ao_list_in_task(ao_list, shell, params))
+	} else {
+		spawn_ao_list_in_task(ao_list, shell, params)
+	};
+
+	Ok(shell.jobs.add_as_current(job))
+}
+
+async fn should_try_spawn_pipeline_as_job(
+	ao_list: &ast::AndOrList,
+	shell: &mut Shell,
+	params: &ExecutionParameters,
+) -> Result<bool, error::Error> {
+	if !ao_list.additional.is_empty() {
+		return Ok(false);
+	}
+
+	let pipeline = &ao_list.first;
+	if pipeline.bang {
+		return Ok(false);
+	}
+
+	let [ast::Command::Simple(simple_cmd)] = pipeline.seq.as_slice() else {
+		return Ok(false);
+	};
+	let Some(command_word) = simple_cmd.word_or_name.as_ref() else {
+		return Ok(false);
+	};
+
+	let expanded = expansion::full_expand_and_split_word(shell, params, command_word).await?;
+	let [command_name] = expanded.as_slice() else {
+		return Ok(false);
+	};
+
+	if shell.aliases.contains_key(command_name) {
+		return Ok(false);
+	}
+	if shell.builtins().get(command_name.as_str()).is_some_and(|registration| !registration.disabled) {
+		return Ok(false);
+	}
+	if shell.funcs().get(command_name.as_str()).is_some() {
+		return Ok(false);
+	}
+
+	Ok(true)
+}
+
+
+async fn try_spawn_pipeline_as_job(
+	pipeline: &ast::Pipeline,
+	command_line: String,
+	shell: &mut Shell,
+	params: &ExecutionParameters,
+) -> Result<Option<jobs::Job>, error::Error> {
+	let mut subshell = shell.clone();
+	subshell.options.interactive = false;
+
+	let spawn_results = spawn_pipeline_processes(pipeline, &mut subshell, params, false).await?;
+	let mut tasks = VecDeque::new();
+
+	for spawn_result in spawn_results {
+		if let ExecutionWaitResult::Stopped(child) = spawn_result.wait(true, None).await? {
+			tasks.push_back(jobs::JobTask::External(child));
+		}
+	}
+
+	if tasks.is_empty() {
+		return Ok(None);
+	}
+
+	Ok(Some(jobs::Job::new(tasks, command_line, jobs::JobState::Running)))
+}
+
+fn spawn_ao_list_in_task(
+	ao_list: &ast::AndOrList,
+	shell: &mut Shell,
+	params: &ExecutionParameters,
+) -> jobs::Job {
 	// Clone the inputs.
 	let mut cloned_shell = shell.clone();
 	let cloned_params = params.clone();
@@ -315,11 +453,11 @@ fn spawn_ao_list_in_task<'a>(
 			.await
 	});
 
-	shell.jobs.add_as_current(jobs::Job::new(
+	jobs::Job::new(
 		[jobs::JobTask::Internal(join_handle)],
 		ao_list.to_string(),
 		jobs::JobState::Running,
-	))
+	)
 }
 
 #[async_trait::async_trait]
@@ -380,7 +518,7 @@ impl Execute for ast::Pipeline {
 
 		// Spawn all the processes required for the pipeline, connecting outputs/inputs
 		// with pipes as needed.
-		let spawn_results = spawn_pipeline_processes(self, shell, params).await?;
+		let spawn_results = spawn_pipeline_processes(self, shell, params, true).await?;
 
 		// Wait for the processes. This also has a side effect of updating pipeline
 		// status.
@@ -428,6 +566,7 @@ async fn spawn_pipeline_processes(
 	pipeline: &ast::Pipeline,
 	shell: &mut Shell,
 	params: &ExecutionParameters,
+	allow_current_shell: bool,
 ) -> Result<VecDeque<ExecutionSpawnResult>, error::Error> {
 	ensure_not_cancelled(params)?;
 	let pipeline_len = pipeline.seq.len();
@@ -437,19 +576,13 @@ async fn spawn_pipeline_processes(
 
 	for (current_pipeline_index, command) in pipeline.seq.iter().enumerate() {
 		ensure_not_cancelled(params)?;
-		//
-		// We run a command directly in the current shell if either of the following is
-		// true:
-		//     * There's only one command in the pipeline.
-		//     * This is the *last* command in the pipeline, the lastpipe option is
-		//       enabled, and job monitoring is disabled.
-		// Otherwise, we spawn a separate subshell for each command in the pipeline.
-		//
-
-		let run_in_current_shell = pipeline_len == 1
-			|| (current_pipeline_index == pipeline_len - 1
-				&& shell.options.run_last_pipeline_cmd_in_current_shell
-				&& !shell.options.enable_job_control);
+		// Background jobs need a real spawned process when possible, so callers can
+		// forbid running a single-command pipeline directly in the parent shell.
+		let run_in_current_shell = allow_current_shell
+			&& (pipeline_len == 1
+				|| (current_pipeline_index == pipeline_len - 1
+					&& shell.options.run_last_pipeline_cmd_in_current_shell
+					&& !shell.options.enable_job_control));
 
 		if !run_in_current_shell {
 			let mut subshell = shell.clone();
@@ -566,6 +699,8 @@ impl ExecuteInPipeline for ast::Command {
 		match self {
 			Self::Simple(simple) => simple.execute_in_pipeline(pipeline_context, params).await,
 			Self::Compound(compound, redirects) => {
+				params.disable_command_output_marking();
+
 				// Set up pipelining.
 				setup_pipeline_redirection(&mut params.open_files, pipeline_context)?;
 
@@ -581,7 +716,10 @@ impl ExecuteInPipeline for ast::Command {
 					.await?
 					.into())
 			},
-			Self::Function(func) => Ok(func.execute(pipeline_context.shell, &params).await?.into()),
+			Self::Function(func) => {
+				params.disable_command_output_marking();
+				Ok(func.execute(pipeline_context.shell, &params).await?.into())
+			},
 			Self::ExtendedTest(e) => {
 				let result =
 					if extendedtests::eval_extended_test_expr(&e.expr, pipeline_context.shell, &params)
@@ -963,6 +1101,9 @@ impl ExecuteInPipeline for ast::SimpleCommand {
 		mut params: ExecutionParameters,
 	) -> Result<ExecutionSpawnResult, error::Error> {
 		ensure_not_cancelled(&params)?;
+		if context.pipeline_len > 1 {
+			params.disable_command_output_marking();
+		}
 		let prefix_iter = self.prefix.as_ref().map(|s| s.0.iter()).unwrap_or_default();
 		let suffix_iter = self.suffix.as_ref().map(|s| s.0.iter()).unwrap_or_default();
 		let cmd_name_items = self
@@ -987,6 +1128,7 @@ impl ExecuteInPipeline for ast::SimpleCommand {
 					}
 				},
 				CommandPrefixOrSuffixItem::ProcessSubstitution(kind, subshell_command) => {
+					params.disable_command_output_marking();
 					let (installed_fd_num, substitution_file) =
 						setup_process_substitution(context.shell, &params, kind, subshell_command)?;
 
@@ -1395,6 +1537,8 @@ pub(crate) async fn setup_redirect(
 	params: &'_ mut ExecutionParameters,
 	redirect: &ast::IoRedirect,
 ) -> Result<(), error::Error> {
+	params.disable_command_output_marking();
+
 	match redirect {
 		ast::IoRedirect::OutputAndError(f, append) => {
 			let mut expanded_fields = expansion::full_expand_and_split_word(shell, params, f).await?;

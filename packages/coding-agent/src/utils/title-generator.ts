@@ -2,40 +2,29 @@
  * Generate session titles using a smol, fast model.
  */
 import * as path from "node:path";
-import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
-import type { Api, Model } from "@oh-my-pi/pi-ai";
-import { completeSimple } from "@oh-my-pi/pi-ai";
-import { logger } from "@oh-my-pi/pi-utils";
+
+import { type Api, completeSimple, type Model } from "@oh-my-pi/pi-ai";
+import { logger, prompt } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
 import { resolveRoleSelection } from "../config/model-resolver";
-import { renderPromptTemplate } from "../config/prompt-templates";
 import type { Settings } from "../config/settings";
 import titleSystemPrompt from "../prompts/system/title-system.md" with { type: "text" };
-import { toReasoningEffort } from "../thinking";
 
-const TITLE_SYSTEM_PROMPT = renderPromptTemplate(titleSystemPrompt);
+const TITLE_SYSTEM_PROMPT = prompt.render(titleSystemPrompt);
 
 const DEFAULT_TERMINAL_TITLE = "π";
 const TERMINAL_TITLE_CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/g;
 
 const MAX_INPUT_CHARS = 2000;
 
-function getTitleModel(
-	registry: ModelRegistry,
-	settings: Settings,
-	currentModel?: Model<Api>,
-): { model: Model<Api>; thinkingLevel?: ThinkingLevel } | undefined {
+function getTitleModel(registry: ModelRegistry, settings: Settings, currentModel?: Model<Api>): Model<Api> | undefined {
 	const availableModels = registry.getAvailable();
 	if (availableModels.length === 0) return undefined;
 
-	const titleModel = resolveRoleSelection(["commit", "smol"], settings, availableModels);
-	if (titleModel) {
-		return { model: titleModel.model, thinkingLevel: titleModel.thinkingLevel };
-	}
+	const titleModel = resolveRoleSelection(["commit", "smol"], settings, availableModels, registry)?.model;
+	if (titleModel) return titleModel;
 
-	if (currentModel) {
-		return { model: currentModel };
-	}
+	if (currentModel) return currentModel;
 
 	return undefined;
 }
@@ -45,7 +34,7 @@ function getTitleModel(
  *
  * @param firstMessage The first user message
  * @param registry Model registry
- * @param settings Settings used to resolve the smol role, including per-role thinking
+ * @param settings Settings used to resolve the smol role
  * @param sessionId Optional session id for sticky API key selection
  */
 export async function generateSessionTitle(
@@ -55,8 +44,8 @@ export async function generateSessionTitle(
 	sessionId?: string,
 	currentModel?: Model<Api>,
 ): Promise<string | null> {
-	const candidate = getTitleModel(registry, settings, currentModel);
-	if (!candidate) {
+	const model = getTitleModel(registry, settings, currentModel);
+	if (!model) {
 		logger.debug("title-generator: no title model found");
 		return null;
 	}
@@ -68,17 +57,20 @@ export async function generateSessionTitle(
 ${truncatedMessage}
 </user-message>`;
 
-	const apiKey = await registry.getApiKey(candidate.model, sessionId);
+	const apiKey = await registry.getApiKey(model, sessionId);
 	if (!apiKey) {
 		logger.debug("title-generator: no API key for smol model", {
-			provider: candidate.model.provider,
-			id: candidate.model.id,
+			provider: model.provider,
+			id: model.id,
 		});
 		return null;
 	}
 
+	// Title generation is a 3-6 word task; force reasoning off so reasoning models
+	// don't burn the entire output budget on internal thinking and return an empty
+	// string. With reasoning disabled, 30 tokens of output is plenty.
 	const request = {
-		model: `${candidate.model.provider}/${candidate.model.id}`,
+		model: `${model.provider}/${model.id}`,
 		systemPrompt: TITLE_SYSTEM_PROMPT,
 		userMessage,
 		maxTokens: 30,
@@ -87,7 +79,7 @@ ${truncatedMessage}
 
 	try {
 		const response = await completeSimple(
-			candidate.model,
+			model,
 			{
 				systemPrompt: request.systemPrompt,
 				messages: [{ role: "user", content: request.userMessage, timestamp: Date.now() }],
@@ -95,7 +87,7 @@ ${truncatedMessage}
 			{
 				apiKey,
 				maxTokens: 30,
-				reasoning: toReasoningEffort(candidate.thinkingLevel),
+				disableReasoning: true,
 			},
 		);
 
@@ -160,10 +152,10 @@ export function formatSessionTerminalTitle(sessionName: string | undefined, cwd?
 }
 
 /**
- * Set the terminal title using OSC 2. Unsupported terminals ignore it.
+ * Set the terminal title using OSC 0 (sets both tab and window title). Unsupported terminals ignore it.
  */
 export function setTerminalTitle(title: string): void {
-	process.stdout.write(`\x1b]2;${sanitizeTerminalTitlePart(title) ?? DEFAULT_TERMINAL_TITLE}\x07`);
+	process.stdout.write(`\x1b]0;${sanitizeTerminalTitlePart(title) ?? DEFAULT_TERMINAL_TITLE}\x07`);
 }
 
 export function setSessionTerminalTitle(sessionName: string | undefined, cwd?: string): void {

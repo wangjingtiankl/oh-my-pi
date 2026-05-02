@@ -28,6 +28,58 @@ const PROVIDER_ID = "claude-plugins";
 const DISPLAY_NAME = "Claude Code Marketplace";
 const PRIORITY = 70; // Below claude.ts (80) so user .claude/ overrides win
 
+interface ClaudePluginManifest {
+	skills?: string;
+	"slash-commands"?: string;
+}
+
+interface ResolvedPluginDir {
+	dir: string;
+	warning?: string;
+}
+
+async function readPluginManifest(root: ClaudePluginRoot): Promise<ClaudePluginManifest | null> {
+	const manifestPath = path.join(root.path, ".claude-plugin", "plugin.json");
+	const raw = await readFile(manifestPath);
+	if (raw === null) return null;
+
+	try {
+		const parsed = JSON.parse(raw);
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+		return parsed as ClaudePluginManifest;
+	} catch {
+		return null;
+	}
+}
+
+function isWithinPluginRoot(rootPath: string, targetPath: string): boolean {
+	const relative = path.relative(rootPath, targetPath);
+	return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+async function resolvePluginDir(
+	root: ClaudePluginRoot,
+	manifestKey: keyof ClaudePluginManifest,
+	fallback: string,
+): Promise<ResolvedPluginDir> {
+	const manifest = await readPluginManifest(root);
+	const fallbackDir = path.join(root.path, fallback);
+	const configured = manifest?.[manifestKey];
+	if (typeof configured !== "string" || !configured.trim()) {
+		return { dir: fallbackDir };
+	}
+
+	const resolved = path.resolve(root.path, configured.trim());
+	if (isWithinPluginRoot(root.path, resolved)) {
+		return { dir: resolved };
+	}
+
+	return {
+		dir: fallbackDir,
+		warning: `[claude-plugins] Ignoring ${String(manifestKey)} path outside plugin root for ${root.id}: ${configured}`,
+	};
+}
+
 // =============================================================================
 // Skills
 // =============================================================================
@@ -41,17 +93,18 @@ async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
 
 	const results = await Promise.all(
 		roots.map(async root => {
-			const skillsDir = path.join(root.path, "skills");
+			const { dir: skillsDir, warning } = await resolvePluginDir(root, "skills", "skills");
 			const result = await scanSkillsFromDir(ctx, {
 				dir: skillsDir,
 				providerId: PROVIDER_ID,
 				level: root.scope,
 			});
-			return { root, result };
+			return { root, result, warning };
 		}),
 	);
 
-	for (const { root, result } of results) {
+	for (const { root, result, warning } of results) {
+		if (warning) warnings.push(warning);
 		for (const skill of result.items) {
 			if (root.plugin) skill.name = `${root.plugin}:${skill.name}`;
 			items.push(skill);
@@ -75,8 +128,8 @@ async function loadSlashCommands(ctx: LoadContext): Promise<LoadResult<SlashComm
 
 	const results = await Promise.all(
 		roots.map(async root => {
-			const commandsDir = path.join(root.path, "commands");
-			return loadFilesFromDir<SlashCommand>(ctx, commandsDir, PROVIDER_ID, root.scope, {
+			const { dir: commandsDir, warning } = await resolvePluginDir(root, "slash-commands", "commands");
+			const result = await loadFilesFromDir<SlashCommand>(ctx, commandsDir, PROVIDER_ID, root.scope, {
 				extensions: ["md"],
 				transform: (name, content, filePath, source) => {
 					const cmdName = name.replace(/\.md$/, "");
@@ -89,10 +142,12 @@ async function loadSlashCommands(ctx: LoadContext): Promise<LoadResult<SlashComm
 					};
 				},
 			});
+			return { result, warning };
 		}),
 	);
 
-	for (const result of results) {
+	for (const { result, warning } of results) {
+		if (warning) warnings.push(warning);
 		items.push(...result.items);
 		if (result.warnings) warnings.push(...result.warnings);
 	}
@@ -210,10 +265,28 @@ async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> 
 		}
 
 		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) continue;
-		const config = parsed as { mcpServers?: Record<string, unknown> };
-		if (!config.mcpServers || typeof config.mcpServers !== "object") continue;
+		const obj = parsed as Record<string, unknown>;
 
-		for (const [serverName, serverCfg] of Object.entries(config.mcpServers)) {
+		// Two shapes are supported:
+		//   nested: { "mcpServers": { name: cfg, ... } }   (OMP/Claude Code project shape)
+		//   flat:   { name: cfg, ... }                      (Claude marketplace plugin shape)
+		// If "mcpServers" is present and an object, treat it as the canonical map.
+		// Otherwise, treat the whole object as the server map.
+		let servers: Record<string, unknown>;
+		if (
+			obj.mcpServers !== undefined &&
+			obj.mcpServers !== null &&
+			typeof obj.mcpServers === "object" &&
+			!Array.isArray(obj.mcpServers)
+		) {
+			servers = obj.mcpServers as Record<string, unknown>;
+		} else if (!("mcpServers" in obj)) {
+			servers = obj;
+		} else {
+			continue;
+		}
+
+		for (const [serverName, serverCfg] of Object.entries(servers)) {
 			if (!serverCfg || typeof serverCfg !== "object" || Array.isArray(serverCfg)) continue;
 			const raw = serverCfg as {
 				enabled?: boolean;
@@ -228,6 +301,13 @@ async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> 
 				oauth?: MCPServer["oauth"];
 				type?: string;
 			};
+			// Require either command (stdio) or url (HTTP/SSE) — Claude marketplace plugins
+			// occasionally ship .mcp.json entries with neither, which would register a useless
+			// server and surface as a connection error at runtime.
+			if (typeof raw.command !== "string" && typeof raw.url !== "string") {
+				warnings.push(`[claude-plugins] Skipping MCP server "${serverName}" in ${mcpPath}: missing command or url`);
+				continue;
+			}
 			const namespacedName = root.plugin ? `${root.plugin}:${serverName}` : serverName;
 			const server: MCPServer = {
 				name: namespacedName,

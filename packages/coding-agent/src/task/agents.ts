@@ -4,18 +4,18 @@
  * Agents are embedded at build time via Bun's import with { type: "text" }.
  */
 import { Effort } from "@oh-my-pi/pi-ai";
-import { renderPromptTemplate } from "../config/prompt-templates";
+import { parseFrontmatter, prompt } from "@oh-my-pi/pi-utils";
 import { parseAgentFields } from "../discovery/helpers";
 import designerMd from "../prompts/agents/designer.md" with { type: "text" };
 import exploreMd from "../prompts/agents/explore.md" with { type: "text" };
 // Embed agent markdown files at build time
 import agentFrontmatterTemplate from "../prompts/agents/frontmatter.md" with { type: "text" };
 import librarianMd from "../prompts/agents/librarian.md" with { type: "text" };
-import oracleMd from "../prompts/agents/oracle.md" with { type: "text" };
+
 import planMd from "../prompts/agents/plan.md" with { type: "text" };
 import reviewerMd from "../prompts/agents/reviewer.md" with { type: "text" };
 import taskMd from "../prompts/agents/task.md" with { type: "text" };
-import { parseFrontmatter } from "../utils/frontmatter";
+
 import type { AgentDefinition, AgentSource } from "./types";
 
 interface AgentFrontmatter {
@@ -35,9 +35,9 @@ interface EmbeddedAgentDef {
 }
 
 function buildAgentContent(def: EmbeddedAgentDef): string {
-	const body = renderPromptTemplate(def.template);
+	const body = prompt.render(def.template);
 	if (!def.frontmatter) return body;
-	return renderPromptTemplate(agentFrontmatterTemplate, { ...def.frontmatter, body });
+	return prompt.render(agentFrontmatterTemplate, { ...def.frontmatter, body });
 }
 
 const EMBEDDED_AGENT_DEFS: EmbeddedAgentDef[] = [
@@ -45,7 +45,6 @@ const EMBEDDED_AGENT_DEFS: EmbeddedAgentDef[] = [
 	{ fileName: "plan.md", template: planMd },
 	{ fileName: "designer.md", template: designerMd },
 	{ fileName: "reviewer.md", template: reviewerMd },
-	{ fileName: "oracle.md", template: oracleMd },
 	{ fileName: "librarian.md", template: librarianMd },
 	{
 		fileName: "task.md",
@@ -70,10 +69,7 @@ const EMBEDDED_AGENT_DEFS: EmbeddedAgentDef[] = [
 	},
 ];
 
-const EMBEDDED_AGENTS: { name: string; content: string }[] = EMBEDDED_AGENT_DEFS.map(def => ({
-	name: def.fileName,
-	content: buildAgentContent(def),
-}));
+// Computed lazily on first loadBundledAgents() call to avoid eager prompt.render at module load.
 
 export class AgentParsingError extends Error {
 	constructor(
@@ -134,7 +130,9 @@ export function loadBundledAgents(): AgentDefinition[] {
 	if (bundledAgentsCache !== null) {
 		return bundledAgentsCache;
 	}
-	bundledAgentsCache = EMBEDDED_AGENTS.map(({ name, content }) => parseAgent(`embedded:${name}`, content, "bundled"));
+	bundledAgentsCache = EMBEDDED_AGENT_DEFS.map(def =>
+		parseAgent(`embedded:${def.fileName}`, buildAgentContent(def), "bundled"),
+	);
 	return bundledAgentsCache;
 }
 

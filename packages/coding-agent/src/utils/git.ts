@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { isEnoent, Snowflake } from "@oh-my-pi/pi-utils";
+import { $which, hasFsCode, isEnoent, Snowflake } from "@oh-my-pi/pi-utils";
 import {
 	parseDiffHunks as parseCommitDiffHunks,
 	parseFileDiffs,
@@ -146,6 +146,11 @@ const NO_OPTIONAL_LOCKS = "--no-optional-locks";
 const HEAD_REF_PREFIX = "ref:";
 const LOCAL_BRANCH_PREFIX = "refs/heads/";
 const DEFAULT_BRANCH_REFS = ["refs/remotes/origin/HEAD", "refs/remotes/upstream/HEAD"] as const;
+const SHORT_LIVED_GIT_CONFIG: readonly (readonly [key: string, value: string])[] = [
+	["core.fsmonitor", "false"],
+	["core.untrackedCache", "false"],
+];
+const REMOTE_ALREADY_EXISTS = /remote .* already exists/i;
 
 interface CommandOptions {
 	readonly env?: Record<string, string | undefined>;
@@ -162,7 +167,7 @@ function normalizeStdin(input: CommandOptions["stdin"]): "ignore" | Uint8Array {
 }
 
 function ensureAvailable(): void {
-	if (!Bun.which("git")) {
+	if (!$which("git")) {
 		throw new Error("git is not installed.");
 	}
 }
@@ -183,10 +188,10 @@ async function runCommand(
 	args: readonly string[],
 	options: CommandOptions = {},
 ): Promise<GitCommandResult> {
-	const commandArgs = options.readOnly ? withNoOptionalLocks(args) : [...args];
+	const commandArgs = withShortLivedGitConfig(options.readOnly ? withNoOptionalLocks(args) : [...args]);
 	const child = Bun.spawn(["git", ...commandArgs], {
 		cwd,
-		env: options.env ? { ...process.env, ...options.env } : undefined,
+		env: options.env ? { ...process.env, GIT_OPTIONAL_LOCKS: "0", ...options.env } : undefined,
 		signal: options.signal,
 		stdin: normalizeStdin(options.stdin),
 		stdout: "pipe",
@@ -210,6 +215,25 @@ async function runCommand(
 function withNoOptionalLocks(args: readonly string[]): string[] {
 	if (args.includes(NO_OPTIONAL_LOCKS)) return [...args];
 	return [NO_OPTIONAL_LOCKS, ...args];
+}
+
+function withShortLivedGitConfig(args: readonly string[]): string[] {
+	const prefix: string[] = [];
+	for (const [key, value] of SHORT_LIVED_GIT_CONFIG) {
+		if (hasGitConfig(args, key, value)) continue;
+		prefix.push("-c", `${key}=${value}`);
+	}
+	return [...prefix, ...args];
+}
+
+function hasGitConfig(args: readonly string[], key: string, value: string): boolean {
+	const expected = `${key}=${value}`;
+	for (let index = 0; index < args.length - 1; index += 1) {
+		if (args[index] === "-c" && args[index + 1] === expected) {
+			return true;
+		}
+	}
+	return false;
 }
 
 async function runChecked(
@@ -242,6 +266,51 @@ async function tryText(
 	const result = await runCommand(cwd, args, options);
 	if (result.exitCode !== 0) return undefined;
 	return result.stdout;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Internal: per-repo write serialization
+// ════════════════════════════════════════════════════════════════════════════
+
+// Git uses lock files (`.git/config.lock`, commit-graph chain locks,
+// `packed-refs.lock`, …) for many of its mutating operations. Each is created
+// O_EXCL with no waiter, so concurrent in-process git invocations against the
+// same repository fail immediately rather than block. Worktrees share the
+// primary repo's `.git` directory, so racing across worktrees has the same
+// failure mode. We give callers a single per-repo serialization point keyed by
+// the primary repo root: any block that mutates repo state should hold this
+// lock so unrelated callers cannot collide on git's internal locks.
+const repoWriteChain = new Map<string, Promise<unknown>>();
+
+/**
+ * Serialize an async block that mutates a git repository against other
+ * in-process callers operating on the same repository. The lock is keyed by
+ * the primary repo root so worktrees of the same repo share a single queue.
+ * Failures in one block do not poison the queue for the next caller.
+ *
+ * Not reentrant: do NOT nest acquisitions for the same repo. Helpers in this
+ * module never auto-acquire — callers wrap the critical section themselves.
+ */
+export async function withRepoLock<T>(cwd: string, fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+	const key = (await repo.primaryRoot(cwd, signal)) ?? cwd;
+	const prior = repoWriteChain.get(key);
+	const run = (async () => {
+		if (prior) {
+			try {
+				await prior;
+			} catch {
+				// A prior caller failing must not block us from running.
+			}
+		}
+		throwIfAborted(signal);
+		return fn();
+	})();
+	repoWriteChain.set(key, run);
+	try {
+		return await run;
+	} finally {
+		if (repoWriteChain.get(key) === run) repoWriteChain.delete(key);
+	}
 }
 
 function splitLines(text: string): string[] {
@@ -299,6 +368,10 @@ async function writeTempPatch(content: string): Promise<string> {
 
 type EntryType = "directory" | "file";
 
+function isOptionalGitMetadataUnavailable(err: unknown): boolean {
+	return isEnoent(err) || hasFsCode(err, "ENFILE") || hasFsCode(err, "EMFILE");
+}
+
 function getEntryTypeSync(gitEntryPath: string): EntryType | null {
 	try {
 		const stat = fs.statSync(gitEntryPath);
@@ -306,7 +379,7 @@ function getEntryTypeSync(gitEntryPath: string): EntryType | null {
 		if (stat.isFile()) return "file";
 		return null;
 	} catch (err) {
-		if (isEnoent(err)) return null;
+		if (isOptionalGitMetadataUnavailable(err)) return null;
 		throw err;
 	}
 }
@@ -318,7 +391,7 @@ async function getEntryType(gitEntryPath: string): Promise<EntryType | null> {
 		if (stat.isFile()) return "file";
 		return null;
 	} catch (err) {
-		if (isEnoent(err)) return null;
+		if (isOptionalGitMetadataUnavailable(err)) return null;
 		throw err;
 	}
 }
@@ -327,7 +400,7 @@ function readOptionalTextSync(filePath: string): string | null {
 	try {
 		return fs.readFileSync(filePath, "utf8");
 	} catch (err) {
-		if (isEnoent(err)) return null;
+		if (isOptionalGitMetadataUnavailable(err)) return null;
 		throw err;
 	}
 }
@@ -336,7 +409,7 @@ async function readOptionalText(filePath: string): Promise<string | null> {
 	try {
 		return await Bun.file(filePath).text();
 	} catch (err) {
-		if (isEnoent(err)) return null;
+		if (isOptionalGitMetadataUnavailable(err)) return null;
 		throw err;
 	}
 }
@@ -928,9 +1001,22 @@ export const remote = {
 		return trimScalar(await tryText(cwd, ["remote", "get-url", name], { readOnly: true, signal }));
 	},
 
-	/** Add a new remote. */
+	/**
+	 * Add a remote pointing at `url`. Idempotent: if a remote named `name`
+	 * already exists with the same URL (e.g. an in-process race or a leftover
+	 * remote from a previous run), this is treated as success. Throws when the
+	 * remote exists with a different URL — that's a real conflict the caller
+	 * needs to resolve, not paper over.
+	 */
 	async add(cwd: string, name: string, url: string, signal?: AbortSignal): Promise<void> {
-		await runEffect(cwd, ["remote", "add", name, url], { signal });
+		const result = await runCommand(cwd, ["remote", "add", name, url], { signal });
+		if (result.exitCode === 0) return;
+		if (REMOTE_ALREADY_EXISTS.test(result.stderr)) {
+			const existing = await remote.url(cwd, name, signal);
+			if (existing === url) return;
+			throw new ToolError(`remote ${name} already exists with URL ${existing ?? "(unset)"}, expected ${url}`);
+		}
+		throw new GitCommandError(["remote", "add", name, url], result);
 	},
 };
 
@@ -1172,6 +1258,23 @@ export async function restore(cwd: string, options: RestoreOptions = {}): Promis
 	await runEffect(cwd, args, { signal: options.signal });
 }
 
+/**
+ * Run `git reset` with options. Default is a soft reset (no flag); pass `hard: true` for a destructive reset.
+ *
+ * NOTE: stage.reset() handles the per-file unstaging case. This helper exists for tree-wide resets.
+ */
+export async function reset(
+	cwd: string,
+	options: { hard?: boolean; mixed?: boolean; soft?: boolean; target?: string; signal?: AbortSignal } = {},
+): Promise<void> {
+	const args = ["reset"];
+	if (options.hard) args.push("--hard");
+	else if (options.mixed) args.push("--mixed");
+	else if (options.soft) args.push("--soft");
+	if (options.target) args.push(options.target);
+	await runEffect(cwd, args, { signal: options.signal });
+}
+
 export async function clean(
 	cwd: string,
 	options: { ignoredOnly?: boolean; paths?: readonly string[]; signal?: AbortSignal } = {},
@@ -1334,13 +1437,13 @@ function formatGhFailure(args: readonly string[], stdout: string, stderr: string
 export const github = {
 	/** Check if `gh` CLI is installed. */
 	available(): boolean {
-		return Boolean(Bun.which("gh"));
+		return Boolean($which("gh"));
 	},
 
 	/** Run a raw `gh` CLI command. Does not throw on non-zero exit. */
 	async run(cwd: string, args: string[], signal?: AbortSignal, options?: GhCommandOptions): Promise<GhCommandResult> {
 		throwIfAborted(signal);
-		if (!Bun.which("gh")) {
+		if (!$which("gh")) {
 			throw new ToolError("GitHub CLI (gh) is not installed. Install it from https://cli.github.com/.");
 		}
 		try {

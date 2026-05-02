@@ -8,10 +8,11 @@
 import {
 	ANTIGRAVITY_SYSTEM_INSTRUCTION,
 	extractRetryDelay,
-	getAntigravityHeaders,
+	getAntigravityUserAgent,
 	getGeminiCliHeaders,
-	refreshGoogleCloudToken,
 } from "@oh-my-pi/pi-ai";
+import { refreshAntigravityToken } from "@oh-my-pi/pi-ai/utils/oauth/google-antigravity";
+import { refreshGoogleCloudToken } from "@oh-my-pi/pi-ai/utils/oauth/google-gemini-cli";
 import { getAgentDbPath } from "@oh-my-pi/pi-utils";
 import { AgentStorage } from "../../../session/agent-storage";
 import type { SearchCitation, SearchResponse, SearchSource } from "../../../web/search/types";
@@ -72,6 +73,30 @@ interface GeminiAuth {
 	isAntigravity: boolean;
 	storage: AgentStorage;
 	credentialId: number;
+	credential: GeminiOAuthCredential;
+}
+
+async function refreshGeminiAuth(auth: GeminiAuth): Promise<boolean> {
+	if (!auth.refreshToken) return false;
+	try {
+		const refreshed = auth.isAntigravity
+			? await refreshAntigravityToken(auth.refreshToken, auth.projectId)
+			: await refreshGoogleCloudToken(auth.refreshToken, auth.projectId);
+		auth.accessToken = refreshed.access;
+		auth.refreshToken = refreshed.refresh ?? auth.refreshToken;
+		auth.storage.updateAuthCredential(auth.credentialId, {
+			...auth.credential,
+			access: auth.accessToken,
+			refresh: auth.refreshToken,
+			expires: refreshed.expires,
+		});
+		auth.credential.access = auth.accessToken;
+		auth.credential.refresh = auth.refreshToken;
+		auth.credential.expires = refreshed.expires;
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 /**
@@ -108,7 +133,10 @@ export async function findGeminiAuth(): Promise<GeminiAuth | null> {
 					// Try to refresh if we have a refresh token
 					if (oauthCred.refresh) {
 						try {
-							const refreshed = await refreshGoogleCloudToken(oauthCred.refresh, projectId);
+							const refreshed =
+								provider === "google-antigravity"
+									? await refreshAntigravityToken(oauthCred.refresh, projectId)
+									: await refreshGoogleCloudToken(oauthCred.refresh, projectId);
 							// Update the credential in storage
 							const updated = {
 								...oauthCred,
@@ -124,6 +152,7 @@ export async function findGeminiAuth(): Promise<GeminiAuth | null> {
 								isAntigravity: provider === "google-antigravity",
 								storage,
 								credentialId: record.id,
+								credential: updated,
 							};
 						} catch {
 							// Refresh failed, skip this credential
@@ -141,6 +170,7 @@ export async function findGeminiAuth(): Promise<GeminiAuth | null> {
 					isAntigravity: provider === "google-antigravity",
 					storage,
 					credentialId: record.id,
+					credential: oauthCred,
 				};
 			}
 		}
@@ -218,7 +248,7 @@ async function callGeminiSearch(
 	usage?: { inputTokens: number; outputTokens: number; totalTokens: number };
 }> {
 	const endpoints = auth.isAntigravity ? ANTIGRAVITY_ENDPOINT_FALLBACKS : [DEFAULT_ENDPOINT];
-	const headers = auth.isAntigravity ? getAntigravityHeaders() : getGeminiCliHeaders();
+	const headers = auth.isAntigravity ? { "User-Agent": getAntigravityUserAgent() } : getGeminiCliHeaders();
 
 	const requestMetadata = auth.isAntigravity
 		? {
@@ -310,6 +340,14 @@ async function callGeminiSearch(
 			}
 
 			const errorText = await response.text();
+			const canRefreshAuth =
+				response.status === 401 ||
+				response.status === 403 ||
+				(response.status === 400 &&
+					/api key not valid|invalid credentials|invalid authentication/i.test(errorText));
+			if (canRefreshAuth && attempt === 0 && (await refreshGeminiAuth(auth))) {
+				continue;
+			}
 			const isRetryableStatus =
 				response.status === 429 ||
 				response.status === 500 ||

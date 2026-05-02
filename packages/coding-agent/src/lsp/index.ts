@@ -1,13 +1,12 @@
 import * as fs from "node:fs";
 import path from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
-import { logger, once, untilAborted } from "@oh-my-pi/pi-utils";
+import { logger, once, prompt, untilAborted } from "@oh-my-pi/pi-utils";
 import type { BunFile } from "bun";
-import { renderPromptTemplate } from "../config/prompt-templates";
 import { type Theme, theme } from "../modes/theme/theme";
 import lspDescription from "../prompts/tools/lsp.md" with { type: "text" };
 import type { ToolSession } from "../tools";
-import { resolveToCwd } from "../tools/path-utils";
+import { formatPathRelativeToCwd, resolveToCwd } from "../tools/path-utils";
 import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
 import { clampTimeout } from "../tools/tool-timeouts";
 import {
@@ -17,10 +16,12 @@ import {
 	type LspServerStatus,
 	notifySaved,
 	refreshFile,
+	sendNotification,
 	sendRequest,
 	setIdleTimeout,
 	syncContent,
 	WARMUP_TIMEOUT_MS,
+	waitForProjectLoaded,
 } from "./client";
 import { getLinterClient } from "./clients";
 import { getServersForFile, type LspConfig, loadConfig } from "./config";
@@ -40,6 +41,7 @@ import {
 	type LspParams,
 	type LspToolDetails,
 	lspSchema,
+	type Position,
 	type PublishedDiagnostics,
 	type ServerConfig,
 	type SymbolInformation,
@@ -48,7 +50,6 @@ import {
 } from "./types";
 import {
 	applyCodeAction,
-	collectGlobMatches,
 	dedupeWorkspaceSymbols,
 	extractHoverText,
 	fileToUri,
@@ -61,8 +62,8 @@ import {
 	formatLocation,
 	formatSymbolInformation,
 	formatWorkspaceEdit,
-	hasGlobPattern,
 	readLocationContext,
+	resolveDiagnosticTargets,
 	resolveSymbolColumn,
 	sortDiagnostics,
 	symbolKindToIcon,
@@ -72,20 +73,31 @@ import {
 export type { LspServerStatus } from "./client";
 export type { LspToolDetails } from "./types";
 
+export interface LspStartupServerInfo {
+	name: string;
+	status: "connecting" | "ready" | "error";
+	fileTypes: string[];
+	error?: string;
+}
+
 /** Result from warming up LSP servers */
 export interface LspWarmupResult {
-	servers: Array<{
-		name: string;
-		status: "ready" | "error";
-		fileTypes: string[];
-		error?: string;
-	}>;
+	servers: Array<LspStartupServerInfo & { status: "ready" | "error" }>;
 }
 
 /** Options for warming up LSP servers */
 export interface LspWarmupOptions {
 	/** Called when starting to connect to servers */
 	onConnecting?: (serverNames: string[]) => void;
+}
+
+export function discoverStartupLspServers(cwd: string): LspStartupServerInfo[] {
+	const config = loadConfig(cwd);
+	return getLspServers(config).map(([name, serverConfig]) => ({
+		name,
+		status: "connecting",
+		fileTypes: serverConfig.fileTypes,
+	}));
 }
 
 /**
@@ -252,6 +264,10 @@ function getLspServerForFile(config: LspConfig, filePath: string): [string, Serv
 	return servers.length > 0 ? servers[0] : null;
 }
 
+function isProjectAwareLspServer(serverConfig: ServerConfig): boolean {
+	return !serverConfig.createClient && !serverConfig.isLinter;
+}
+
 const DIAGNOSTIC_MESSAGE_LIMIT = 50;
 const SINGLE_DIAGNOSTICS_WAIT_TIMEOUT_MS = 3000;
 const BATCH_DIAGNOSTICS_WAIT_TIMEOUT_MS = 400;
@@ -267,6 +283,21 @@ function limitDiagnosticMessages(messages: string[]): string[] {
 
 const LOCATION_CONTEXT_LINES = 1;
 const REFERENCE_CONTEXT_LIMIT = 50;
+
+const REFERENCES_RETRY_COUNT = 2;
+const REFERENCES_RETRY_DELAY_MS = 250;
+
+function comparePosition(a: Position, b: Position): number {
+	return a.line === b.line ? a.character - b.character : a.line - b.line;
+}
+
+function rangeContainsPosition(range: Location["range"], position: Position): boolean {
+	return comparePosition(range.start, position) <= 0 && comparePosition(position, range.end) <= 0;
+}
+
+function isOnlyQueriedDeclaration(locations: Location[], uri: string, position: Position): boolean {
+	return locations.length === 1 && locations[0]?.uri === uri && rangeContainsPosition(locations[0].range, position);
+}
 
 function normalizeLocationResult(result: Location | Location[] | LocationLink | LocationLink[] | null): Location[] {
 	if (!result) return [];
@@ -295,6 +326,61 @@ async function formatLocationWithContext(location: Location, cwd: string): Promi
 	}
 	return `${header}\n${context.map(lineText => `    ${lineText}`).join("\n")}`;
 }
+
+const MAX_RENAME_PAIRS = 1000;
+
+interface FileRenamePair {
+	oldUri: string;
+	newUri: string;
+}
+
+/**
+ * Enumerate the {oldUri, newUri} pairs needed for an LSP willRenameFiles/didRenameFiles request.
+ * For files this is a single pair. For directories this walks every regular file underneath
+ * and produces a parallel pair anchored at the new directory root.
+ */
+async function enumerateRenamePairs(
+	source: string,
+	dest: string,
+): Promise<{ pairs: FileRenamePair[]; directory: boolean; exceeded: boolean }> {
+	const stat = await fs.promises.stat(source);
+	if (!stat.isDirectory()) {
+		return {
+			pairs: [{ oldUri: fileToUri(source), newUri: fileToUri(dest) }],
+			directory: false,
+			exceeded: false,
+		};
+	}
+	const entries = await fs.promises.readdir(source, { recursive: true, withFileTypes: true });
+	const pairs: FileRenamePair[] = [];
+	for (const entry of entries) {
+		if (!entry.isFile()) continue;
+		if (pairs.length >= MAX_RENAME_PAIRS) {
+			return { pairs, directory: true, exceeded: true };
+		}
+		const parent = entry.parentPath ?? source;
+		const absOld = path.join(parent, entry.name);
+		const rel = path.relative(source, absOld);
+		pairs.push({
+			oldUri: fileToUri(absOld),
+			newUri: fileToUri(path.join(dest, rel)),
+		});
+	}
+	return { pairs, directory: true, exceeded: false };
+}
+
+/** True when an LSP error indicates the server doesn't implement the requested method. */
+function isMethodNotFoundError(err: unknown): boolean {
+	if (!(err instanceof Error)) return false;
+	const msg = err.message.toLowerCase();
+	return (
+		msg.includes("method not found") ||
+		msg.includes("unhandled method") ||
+		msg.includes("not supported") ||
+		msg.includes("-32601")
+	);
+}
+
 async function reloadServer(client: LspClient, serverName: string, signal?: AbortSignal): Promise<string> {
 	let output = `Restarted ${serverName}`;
 	const reloadMethods = ["rust-analyzer/reloadWorkspace", "workspace/didChangeConfiguration"];
@@ -532,7 +618,7 @@ async function getDiagnosticsForFile(
 	}
 
 	const uri = fileToUri(absolutePath);
-	const relPath = path.relative(cwd, absolutePath);
+	const relPath = formatPathRelativeToCwd(absolutePath, cwd);
 	const allDiagnostics: Diagnostic[] = [];
 	const serverNames: string[] = [];
 
@@ -550,6 +636,10 @@ async function getDiagnosticsForFile(
 			// Default: use LSP
 			const client = await getOrCreateClient(serverConfig, cwd);
 			throwIfAborted(signal);
+			if (isProjectAwareLspServer(serverConfig)) {
+				await waitForProjectLoaded(client, signal);
+				throwIfAborted(signal);
+			}
 			// Content already synced + didSave sent, wait for fresh diagnostics
 			const minVersion = minVersions?.get(serverName);
 			const expectedDocumentVersion = expectedDocumentVersions?.get(serverName);
@@ -692,7 +782,24 @@ export interface WritethroughOptions {
 	enableFormat?: boolean;
 	/** Whether to get LSP diagnostics after writing */
 	enableDiagnostics?: boolean;
+	/** Called when diagnostics arrive after the main timeout. */
+	onDeferredDiagnostics?: (diagnostics: FileDiagnosticsResult) => void;
+	/** Signal to cancel a pending deferred diagnostics fetch. */
+	deferredSignal?: AbortSignal;
 }
+
+/** Internal resolved form of {@link WritethroughOptions} that the writethrough machinery operates on. */
+type ResolvedWritethroughOptions = {
+	enableFormat: boolean;
+	enableDiagnostics: boolean;
+};
+
+/** Per-file deferred LSP diagnostics wiring for {@link WritethroughCallback}. */
+export type WritethroughDeferredHandle = {
+	onDeferredDiagnostics: (diagnostics: FileDiagnosticsResult) => void;
+	signal: AbortSignal;
+	finalize: (diagnostics: FileDiagnosticsResult | undefined) => void;
+};
 
 /** Callback type for the LSP writethrough */
 export type WritethroughCallback = (
@@ -701,6 +808,7 @@ export type WritethroughCallback = (
 	signal?: AbortSignal,
 	file?: BunFile,
 	batch?: LspWritethroughBatchRequest,
+	getDeferred?: (dst: string) => WritethroughDeferredHandle | undefined,
 ) => Promise<FileDiagnosticsResult | undefined>;
 
 /** No-op writethrough callback */
@@ -709,6 +817,8 @@ export async function writethroughNoop(
 	content: string,
 	_signal?: AbortSignal,
 	file?: BunFile,
+	_batch?: LspWritethroughBatchRequest,
+	_getDeferred?: (dst: string) => WritethroughDeferredHandle | undefined,
 ): Promise<FileDiagnosticsResult | undefined> {
 	if (file) {
 		await file.write(content);
@@ -731,12 +841,12 @@ interface LspWritethroughBatchRequest {
 
 interface LspWritethroughBatchState {
 	entries: Map<string, PendingWritethrough>;
-	options: Required<WritethroughOptions>;
+	options: ResolvedWritethroughOptions;
 }
 
 const writethroughBatches = new Map<string, LspWritethroughBatchState>();
 
-function getOrCreateWritethroughBatch(id: string, options: Required<WritethroughOptions>): LspWritethroughBatchState {
+function getOrCreateWritethroughBatch(id: string, options: ResolvedWritethroughOptions): LspWritethroughBatchState {
 	const existing = writethroughBatches.get(id);
 	if (existing) {
 		existing.options.enableFormat ||= options.enableFormat;
@@ -787,7 +897,7 @@ function summarizeDiagnosticMessages(messages: string[]): { summary: string; err
 
 function mergeDiagnostics(
 	results: Array<FileDiagnosticsResult | undefined>,
-	options: Required<WritethroughOptions>,
+	options: ResolvedWritethroughOptions,
 ): FileDiagnosticsResult | undefined {
 	const messages: string[] = [];
 	const servers = new Set<string>();
@@ -841,13 +951,41 @@ function mergeDiagnostics(
 	};
 }
 
+async function scheduleDeferredDiagnosticsFetch(args: {
+	dst: string;
+	cwd: string;
+	servers: Array<[string, ServerConfig]>;
+	minVersions: ServerVersionMap | undefined;
+	expectedDocumentVersions: ServerVersionMap | undefined;
+	signal: AbortSignal;
+	callback: (diagnostics: FileDiagnosticsResult) => void;
+}): Promise<void> {
+	try {
+		const deferredTimeout = AbortSignal.timeout(25_000);
+		const combined = AbortSignal.any([args.signal, deferredTimeout]);
+		const diagnostics = await getDiagnosticsForFile(args.dst, args.cwd, args.servers, {
+			signal: combined,
+			minVersions: args.minVersions,
+			expectedDocumentVersions: args.expectedDocumentVersions,
+		});
+		if (args.signal.aborted || diagnostics === undefined) return;
+		args.callback(diagnostics);
+	} catch {
+		// Cancelled or LSP gave up; silently discard.
+	}
+}
+
 async function runLspWritethrough(
 	dst: string,
 	content: string,
 	cwd: string,
-	options: Required<WritethroughOptions>,
+	options: ResolvedWritethroughOptions,
 	signal?: AbortSignal,
 	file?: BunFile,
+	deferred?: {
+		onDeferredDiagnostics: (diagnostics: FileDiagnosticsResult) => void;
+		signal: AbortSignal;
+	},
 ): Promise<FileDiagnosticsResult | undefined> {
 	const { enableFormat, enableDiagnostics } = options;
 	const config = getConfig(cwd);
@@ -870,7 +1008,7 @@ async function runLspWritethrough(
 	let diagnostics: FileDiagnosticsResult | undefined;
 	let timedOut = false;
 	try {
-		const timeoutSignal = AbortSignal.timeout(10_000);
+		const timeoutSignal = AbortSignal.timeout(5_000);
 		timeoutSignal.addEventListener(
 			"abort",
 			() => {
@@ -927,6 +1065,18 @@ async function runLspWritethrough(
 		if (timedOut) {
 			formatter = undefined;
 			diagnostics = undefined;
+			// Schedule background diagnostic fetch if caller wants deferred results
+			if (deferred && !deferred.signal.aborted && enableDiagnostics) {
+				void scheduleDeferredDiagnosticsFetch({
+					dst,
+					cwd,
+					servers,
+					minVersions,
+					expectedDocumentVersions,
+					signal: deferred.signal,
+					callback: deferred.onDeferredDiagnostics,
+				});
+			}
 		}
 		await getWritePromise();
 	}
@@ -947,22 +1097,32 @@ async function runLspWritethrough(
 async function flushWritethroughBatch(
 	batch: PendingWritethrough[],
 	cwd: string,
-	options: Required<WritethroughOptions>,
+	options: ResolvedWritethroughOptions,
 	signal?: AbortSignal,
+	getDeferred?: (dst: string) => WritethroughDeferredHandle | undefined,
 ): Promise<FileDiagnosticsResult | undefined> {
 	if (batch.length === 0) {
 		return undefined;
 	}
 	const results: Array<FileDiagnosticsResult | undefined> = [];
 	for (const entry of batch) {
-		results.push(await runLspWritethrough(entry.dst, entry.content, cwd, options, signal, entry.file));
+		const bundle = getDeferred?.(entry.dst);
+		const deferredInner =
+			bundle &&
+			({
+				onDeferredDiagnostics: bundle.onDeferredDiagnostics,
+				signal: bundle.signal,
+			} as const);
+		const diag = await runLspWritethrough(entry.dst, entry.content, cwd, options, signal, entry.file, deferredInner);
+		bundle?.finalize(diag);
+		results.push(diag);
 	}
 	return mergeDiagnostics(results, options);
 }
 
 /** Create a writethrough callback for LSP aware write operations */
 export function createLspWritethrough(cwd: string, options?: WritethroughOptions): WritethroughCallback {
-	const resolvedOptions: Required<WritethroughOptions> = {
+	const resolvedOptions: ResolvedWritethroughOptions = {
 		enableFormat: options?.enableFormat ?? false,
 		enableDiagnostics: options?.enableDiagnostics ?? false,
 	};
@@ -975,9 +1135,19 @@ export function createLspWritethrough(cwd: string, options?: WritethroughOptions
 		signal?: AbortSignal,
 		file?: BunFile,
 		batch?: LspWritethroughBatchRequest,
+		getDeferred?: (dst: string) => WritethroughDeferredHandle | undefined,
 	) => {
 		if (!batch) {
-			return runLspWritethrough(dst, content, cwd, resolvedOptions, signal, file);
+			const bundle = getDeferred?.(dst);
+			const deferredInner =
+				bundle &&
+				({
+					onDeferredDiagnostics: bundle.onDeferredDiagnostics,
+					signal: bundle.signal,
+				} as const);
+			const diagnostics = await runLspWritethrough(dst, content, cwd, resolvedOptions, signal, file, deferredInner);
+			bundle?.finalize(diagnostics);
+			return diagnostics;
 		}
 
 		const state = getOrCreateWritethroughBatch(batch.id, resolvedOptions);
@@ -989,7 +1159,7 @@ export function createLspWritethrough(cwd: string, options?: WritethroughOptions
 		}
 
 		writethroughBatches.delete(batch.id);
-		return flushWritethroughBatch(Array.from(state.entries.values()), cwd, state.options, signal);
+		return flushWritethroughBatch(Array.from(state.entries.values()), cwd, state.options, signal, getDeferred);
 	};
 }
 
@@ -1001,14 +1171,14 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 	readonly label = "LSP";
 	readonly description: string;
 	readonly parameters = lspSchema;
-	readonly strict = true;
 	readonly renderCall = renderCall;
 	readonly renderResult = renderResult;
 	readonly mergeCallAndResult = true;
 	readonly inline = true;
+	readonly strict = true;
 
 	constructor(private readonly session: ToolSession) {
-		this.description = renderPromptTemplate(lspDescription);
+		this.description = prompt.render(lspDescription);
 	}
 
 	static createIf(session: ToolSession): LspTool | null {
@@ -1022,7 +1192,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 		_onUpdate?: AgentToolUpdateCallback<LspToolDetails>,
 		_context?: AgentToolContext,
 	): Promise<AgentToolResult<LspToolDetails>> {
-		const { action, file, line, symbol, occurrence, query, new_name, apply, timeout } = params;
+		const { action, file, line, symbol, query, new_name, apply, timeout } = params;
 		const timeoutSec = clampTimeout("lsp", timeout);
 		const timeoutSignal = AbortSignal.timeout(timeoutSec * 1000);
 		signal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
@@ -1054,8 +1224,8 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 
 		// Diagnostics can be batch or single-file - queries all applicable servers
 		if (action === "diagnostics") {
-			if (!file) {
-				// No file specified - run workspace diagnostics
+			if (file === "*") {
+				// `*` => run workspace diagnostics across all configured servers
 				const result = await runWorkspaceDiagnostics(this.session.cwd, signal);
 				return {
 					content: [
@@ -1068,15 +1238,23 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 				};
 			}
 
+			if (!file) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: "Error: file parameter required. Use `*` for workspace-wide diagnostics or a path/glob for specific files.",
+						},
+					],
+					details: { action, success: false, request: params },
+				};
+			}
+
 			let targets: string[];
 			let truncatedGlobTargets = false;
-			if (hasGlobPattern(file)) {
-				const globMatches = await collectGlobMatches(file, this.session.cwd, MAX_GLOB_DIAGNOSTIC_TARGETS);
-				targets = globMatches.matches;
-				truncatedGlobTargets = globMatches.truncated;
-			} else {
-				targets = [file];
-			}
+			const resolvedTargets = await resolveDiagnosticTargets(file, this.session.cwd, MAX_GLOB_DIAGNOSTIC_TARGETS);
+			targets = resolvedTargets.matches;
+			truncatedGlobTargets = resolvedTargets.truncated;
 
 			if (targets.length === 0) {
 				return {
@@ -1107,7 +1285,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 				}
 
 				const uri = fileToUri(resolved);
-				const relPath = path.relative(this.session.cwd, resolved);
+				const relPath = formatPathRelativeToCwd(resolved, this.session.cwd);
 				const allDiagnostics: Diagnostic[] = [];
 
 				// Query all applicable servers for this file
@@ -1122,6 +1300,10 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 							continue;
 						}
 						const client = await getOrCreateClient(serverConfig, this.session.cwd);
+						if (isProjectAwareLspServer(serverConfig)) {
+							await waitForProjectLoaded(client, signal);
+							throwIfAborted(signal);
+						}
 						const minVersion = client.diagnosticsVersion;
 						await refreshFile(client, resolved, signal);
 						const expectedDocumentVersion = client.openFiles.get(uri)?.version;
@@ -1186,17 +1368,363 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			};
 		}
 
-		const requiresFile = !file && action !== "symbols" && action !== "reload";
+		if (action === "rename_file") {
+			if (!file || !new_name) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: "Error: rename_file requires both `file` (source path) and `new_name` (destination path)",
+						},
+					],
+					details: { action, success: false, request: params },
+				};
+			}
+
+			const source = resolveToCwd(file, this.session.cwd);
+			const dest = resolveToCwd(new_name, this.session.cwd);
+
+			if (source === dest) {
+				return {
+					content: [{ type: "text", text: "Error: source and destination paths are identical" }],
+					details: { action, success: false, request: params },
+				};
+			}
+
+			let sourceStat: fs.Stats;
+			try {
+				sourceStat = await fs.promises.stat(source);
+			} catch {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Error: source path does not exist: ${formatPathRelativeToCwd(source, this.session.cwd)}`,
+						},
+					],
+					details: { action, success: false, request: params },
+				};
+			}
+
+			let destExists = false;
+			try {
+				await fs.promises.stat(dest);
+				destExists = true;
+			} catch {
+				// expected: destination must not exist
+			}
+			if (destExists) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Error: destination already exists: ${formatPathRelativeToCwd(dest, this.session.cwd)}`,
+						},
+					],
+					details: { action, success: false, request: params },
+				};
+			}
+
+			const enumerated = await enumerateRenamePairs(source, dest);
+			if (enumerated.exceeded) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Error: directory contains more than ${MAX_RENAME_PAIRS} files; rename in smaller batches to keep LSP edits accurate`,
+						},
+					],
+					details: { action, success: false, request: params },
+				};
+			}
+			const { pairs } = enumerated;
+			if (pairs.length === 0) {
+				return {
+					content: [{ type: "text", text: "Error: no files to rename" }],
+					details: { action, success: false, request: params },
+				};
+			}
+
+			const lspParams = { files: pairs };
+			const servers = getLspServers(config);
+			const respondingServers = new Set<string>();
+			const perServerEdits: Array<{ serverName: string; edit: WorkspaceEdit }> = [];
+			const serverNotes: string[] = [];
+
+			for (const [serverName, serverConfig] of servers) {
+				throwIfAborted(signal);
+				try {
+					const client = await getOrCreateClient(serverConfig, this.session.cwd);
+					if (isProjectAwareLspServer(serverConfig)) {
+						await waitForProjectLoaded(client, signal);
+					}
+					const result = (await sendRequest(
+						client,
+						"workspace/willRenameFiles",
+						lspParams,
+						signal,
+					)) as WorkspaceEdit | null;
+					respondingServers.add(serverName);
+					if (result && (result.changes || result.documentChanges)) {
+						perServerEdits.push({ serverName, edit: result });
+					}
+				} catch (err) {
+					if (err instanceof ToolAbortError || signal?.aborted) {
+						throw err;
+					}
+					if (!isMethodNotFoundError(err)) {
+						const msg = err instanceof Error ? err.message : String(err);
+						serverNotes.push(`  ${serverName}: ${msg}`);
+					}
+				}
+			}
+
+			const sourceLabel = formatPathRelativeToCwd(source, this.session.cwd);
+			const destLabel = formatPathRelativeToCwd(dest, this.session.cwd);
+			const fileCountLabel = sourceStat.isDirectory()
+				? `${pairs.length} file${pairs.length !== 1 ? "s" : ""} under ${sourceLabel}`
+				: sourceLabel;
+
+			const shouldApply = apply !== false;
+			if (!shouldApply) {
+				const lines: string[] = [];
+				lines.push(`Rename preview: ${fileCountLabel} → ${destLabel}`);
+				if (perServerEdits.length === 0) {
+					lines.push("  No LSP edits would be applied");
+				} else {
+					for (const { serverName, edit } of perServerEdits) {
+						const edits = formatWorkspaceEdit(edit, this.session.cwd);
+						if (edits.length === 0) continue;
+						lines.push(`  ${serverName}:`);
+						for (const e of edits) {
+							lines.push(`    ${e}`);
+						}
+					}
+				}
+				if (serverNotes.length > 0) {
+					lines.push("  Server notes:");
+					lines.push(...serverNotes);
+				}
+				return {
+					content: [{ type: "text", text: lines.join("\n") }],
+					details: {
+						action,
+						serverName: Array.from(respondingServers).join(", "),
+						success: true,
+						request: params,
+					},
+				};
+			}
+
+			const summary: string[] = [];
+			for (const { serverName, edit } of perServerEdits) {
+				const applied = await applyWorkspaceEdit(edit, this.session.cwd);
+				if (applied.length > 0) {
+					summary.push(`  ${serverName}:`);
+					summary.push(...applied.map(line => `    ${line}`));
+				}
+			}
+
+			await fs.promises.mkdir(path.dirname(dest), { recursive: true });
+			await fs.promises.rename(source, dest);
+			summary.push(`  Renamed ${sourceLabel} → ${destLabel}`);
+
+			for (const [serverName, serverConfig] of servers) {
+				try {
+					const client = await getOrCreateClient(serverConfig, this.session.cwd);
+					for (const { oldUri } of pairs) {
+						if (client.openFiles.has(oldUri)) {
+							await sendNotification(client, "textDocument/didClose", {
+								textDocument: { uri: oldUri },
+							});
+							client.openFiles.delete(oldUri);
+						}
+					}
+					await sendNotification(client, "workspace/didRenameFiles", lspParams);
+				} catch (err) {
+					if (err instanceof ToolAbortError || signal?.aborted) {
+						throw err;
+					}
+					const msg = err instanceof Error ? err.message : String(err);
+					serverNotes.push(`  ${serverName}: ${msg}`);
+				}
+			}
+
+			if (serverNotes.length > 0) {
+				summary.push("  Server notes:");
+				summary.push(...serverNotes);
+			}
+
+			const header = `Renamed ${fileCountLabel} → ${destLabel}`;
+			return {
+				content: [{ type: "text", text: `${header}\n${summary.join("\n")}` }],
+				details: {
+					action,
+					serverName: Array.from(respondingServers).join(", "),
+					success: true,
+					request: params,
+				},
+			};
+		}
+
+		if (action === "capabilities") {
+			let serverList: Array<[string, ServerConfig]>;
+			if (file && file !== "*") {
+				const resolved = resolveToCwd(file, this.session.cwd);
+				serverList = getLspServersForFile(config, resolved);
+				if (serverList.length === 0) {
+					return {
+						content: [{ type: "text", text: "No language server found for this file" }],
+						details: { action, success: false, request: params },
+					};
+				}
+			} else {
+				serverList = getLspServers(config);
+			}
+
+			if (serverList.length === 0) {
+				return {
+					content: [{ type: "text", text: "No language servers configured" }],
+					details: { action, success: false, request: params },
+				};
+			}
+
+			const sections: string[] = [];
+			const respondingServers = new Set<string>();
+			for (const [serverName, serverConfig] of serverList) {
+				throwIfAborted(signal);
+				try {
+					const client = await getOrCreateClient(serverConfig, this.session.cwd);
+					respondingServers.add(serverName);
+					const caps = client.serverCapabilities ?? {};
+					sections.push(`${serverName}:`);
+					sections.push(`  capabilities: ${JSON.stringify(caps, null, 2).split("\n").join("\n  ")}`);
+				} catch (err) {
+					if (err instanceof ToolAbortError || signal?.aborted) {
+						throw err;
+					}
+					const msg = err instanceof Error ? err.message : String(err);
+					sections.push(`${serverName}: failed to start (${msg})`);
+				}
+			}
+
+			return {
+				content: [{ type: "text", text: sections.join("\n") }],
+				details: {
+					action,
+					serverName: Array.from(respondingServers).join(", "),
+					success: true,
+					request: params,
+				},
+			};
+		}
+
+		if (action === "request") {
+			const method = query?.trim();
+			if (!method) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: "Error: action=request requires `query` to specify the LSP method name (e.g., 'rust-analyzer/expandMacro')",
+						},
+					],
+					details: { action, success: false, request: params },
+				};
+			}
+
+			let chosenServer: [string, ServerConfig] | null = null;
+			let resolvedTarget: string | null = null;
+			if (file && file !== "*") {
+				resolvedTarget = resolveToCwd(file, this.session.cwd);
+				chosenServer = getLspServerForFile(config, resolvedTarget);
+				if (!chosenServer) {
+					return {
+						content: [{ type: "text", text: "No language server found for this file" }],
+						details: { action, success: false, request: params },
+					};
+				}
+			} else {
+				const all = getLspServers(config);
+				if (all.length === 0) {
+					return {
+						content: [{ type: "text", text: "No language servers configured" }],
+						details: { action, success: false, request: params },
+					};
+				}
+				chosenServer = all[0];
+			}
+
+			const [chosenName, chosenConfig] = chosenServer;
+			let requestParams: unknown;
+			if (params.payload !== undefined) {
+				try {
+					requestParams = JSON.parse(params.payload);
+				} catch (err) {
+					const msg = err instanceof Error ? err.message : String(err);
+					return {
+						content: [{ type: "text", text: `Error: invalid JSON in payload: ${msg}` }],
+						details: { action, serverName: chosenName, success: false, request: params },
+					};
+				}
+			} else if (resolvedTarget) {
+				const uri = fileToUri(resolvedTarget);
+				if (line !== undefined) {
+					const character = await resolveSymbolColumn(resolvedTarget, line, symbol);
+					requestParams = { textDocument: { uri }, position: { line: line - 1, character } };
+				} else {
+					requestParams = { textDocument: { uri } };
+				}
+			} else {
+				requestParams = {};
+			}
+
+			try {
+				const client = await getOrCreateClient(chosenConfig, this.session.cwd);
+				if (resolvedTarget) {
+					await ensureFileOpen(client, resolvedTarget, signal);
+				}
+				const result = await sendRequest(client, method, requestParams, signal);
+				const formatted =
+					result === null || result === undefined
+						? "null"
+						: typeof result === "string"
+							? result
+							: JSON.stringify(result, null, 2);
+				return {
+					content: [{ type: "text", text: `${chosenName} ← ${method}:\n${formatted}` }],
+					details: { action, serverName: chosenName, success: true, request: params },
+				};
+			} catch (err) {
+				if (err instanceof ToolAbortError || signal?.aborted) {
+					throw new ToolAbortError();
+				}
+				const msg = err instanceof Error ? err.message : String(err);
+				return {
+					content: [{ type: "text", text: `LSP error from ${chosenName} on ${method}: ${msg}` }],
+					details: { action, serverName: chosenName, success: false, request: params },
+				};
+			}
+		}
+
+		// `*` means workspace scope for symbols/reload; other actions need a concrete file.
+		const isWorkspace = file === "*";
+		const requiresFile = !file && action !== "reload";
 
 		if (requiresFile) {
 			return {
-				content: [{ type: "text", text: "Error: file parameter required for this action" }],
+				content: [
+					{
+						type: "text",
+						text: "Error: file parameter required. Use `*` for workspace scope where supported.",
+					},
+				],
 				details: { action, success: false },
 			};
 		}
 
-		const resolvedFile = file ? resolveToCwd(file, this.session.cwd) : null;
-		if (action === "symbols" && !resolvedFile) {
+		const resolvedFile = file && !isWorkspace ? resolveToCwd(file, this.session.cwd) : null;
+		if (action === "symbols" && (isWorkspace || !resolvedFile)) {
 			const normalizedQuery = query?.trim();
 			if (!normalizedQuery) {
 				return {
@@ -1268,7 +1796,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			};
 		}
 
-		if (action === "reload" && !resolvedFile) {
+		if (action === "reload" && (isWorkspace || !resolvedFile)) {
 			const servers = getLspServers(config);
 			if (servers.length === 0) {
 				return {
@@ -1316,12 +1844,17 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 
 			const uri = targetFile ? fileToUri(targetFile) : "";
 			const resolvedLine = line ?? 1;
-			const resolvedCharacter = targetFile
-				? await resolveSymbolColumn(targetFile, resolvedLine, symbol, occurrence)
-				: 0;
+			const resolvedCharacter = targetFile ? await resolveSymbolColumn(targetFile, resolvedLine, symbol) : 0;
 			const position = { line: resolvedLine - 1, character: resolvedCharacter };
 
 			let output: string;
+
+			// Wait for project loading to complete before cross-file operations
+			// to ensure the server has indexed all project files.
+			const crossFileActions = new Set(["definition", "type_definition", "implementation", "references", "rename"]);
+			if (crossFileActions.has(action)) {
+				await waitForProjectLoaded(client, signal);
+			}
 
 			switch (action) {
 				// =====================================================================
@@ -1400,16 +1933,31 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 					break;
 				}
 				case "references": {
-					const result = (await sendRequest(
-						client,
-						"textDocument/references",
-						{
-							textDocument: { uri },
-							position,
-							context: { includeDeclaration: true },
-						},
-						signal,
-					)) as Location[] | null;
+					let result: Location[] | null = null;
+					for (let attempt = 0; attempt <= REFERENCES_RETRY_COUNT; attempt++) {
+						result = (await sendRequest(
+							client,
+							"textDocument/references",
+							{
+								textDocument: { uri },
+								position,
+								context: { includeDeclaration: true },
+							},
+							signal,
+						)) as Location[] | null;
+
+						const locations = result ?? [];
+						if (!isProjectAwareLspServer(serverConfig) || attempt === REFERENCES_RETRY_COUNT) {
+							break;
+						}
+						if (locations.length > 0 && !isOnlyQueriedDeclaration(locations, uri, position)) {
+							break;
+						}
+
+						await waitForProjectLoaded(client, signal);
+						throwIfAborted(signal);
+						await untilAborted(signal, () => Bun.sleep(REFERENCES_RETRY_DELAY_MS));
+					}
 
 					if (!result || result.length === 0) {
 						output = "No references found";
@@ -1552,7 +2100,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 					if (!result || result.length === 0) {
 						output = "No symbols found";
 					} else {
-						const relPath = path.relative(this.session.cwd, targetFile);
+						const relPath = formatPathRelativeToCwd(targetFile, this.session.cwd);
 						if ("selectionRange" in result[0]) {
 							const lines = (result as DocumentSymbol[]).flatMap(s => formatDocumentSymbol(s));
 							output = `Symbols in ${relPath}:\n${lines.join("\n")}`;

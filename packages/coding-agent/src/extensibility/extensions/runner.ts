@@ -2,14 +2,14 @@
  * Extension runner - executes extensions and manages their lifecycle.
  */
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
-import type { SearchDb } from "@oh-my-pi/pi-natives";
+import type { ImageContent, Model, ProviderResponseMetadata } from "@oh-my-pi/pi-ai";
 import type { KeyId } from "@oh-my-pi/pi-tui";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../../config/model-registry";
 import { type Theme, theme } from "../../modes/theme/theme";
 import type { SessionManager } from "../../session/session-manager";
 import type {
+	AfterProviderResponseEvent,
 	BeforeAgentStartEvent,
 	BeforeAgentStartEventResult,
 	BeforeProviderRequestEvent,
@@ -71,6 +71,7 @@ type RunnerEmitEvent = Exclude<
 	| UserBashEvent
 	| ContextEvent
 	| BeforeProviderRequestEvent
+	| AfterProviderResponseEvent
 	| BeforeAgentStartEvent
 	| ResourcesDiscoverEvent
 	| InputEvent
@@ -161,7 +162,6 @@ export class ExtensionRunner {
 	#uiContext: ExtensionUIContext;
 	#errorListeners: Set<ExtensionErrorListener> = new Set();
 	#getModel: () => Model | undefined = () => undefined;
-	#getSearchDbFn: () => SearchDb | undefined = () => undefined;
 	#isIdleFn: () => boolean = () => true;
 	#waitForIdleFn: () => Promise<void> = async () => {};
 	#abortFn: () => void = () => {};
@@ -204,10 +204,11 @@ export class ExtensionRunner {
 		this.runtime.setModel = actions.setModel;
 		this.runtime.getThinkingLevel = actions.getThinkingLevel;
 		this.runtime.setThinkingLevel = actions.setThinkingLevel;
+		this.runtime.getSessionName = actions.getSessionName;
+		this.runtime.setSessionName = actions.setSessionName;
 
 		// Context actions (required)
 		this.#getModel = contextActions.getModel;
-		this.#getSearchDbFn = contextActions.getSearchDb ?? (() => undefined);
 		this.#isIdleFn = contextActions.isIdle;
 		this.#abortFn = contextActions.abort;
 		this.#hasPendingMessagesFn = contextActions.hasPendingMessages;
@@ -260,6 +261,10 @@ export class ExtensionRunner {
 			}
 		}
 		return allFlags;
+	}
+
+	getFlagValues(): Map<string, boolean | string> {
+		return new Map(this.runtime.flagValues);
 	}
 
 	setFlagValue(name: string, value: boolean | string): void {
@@ -379,7 +384,6 @@ export class ExtensionRunner {
 
 	createContext(): ExtensionContext {
 		const getModel = this.#getModel;
-		const getSearchDb = this.#getSearchDbFn;
 		return {
 			ui: this.#uiContext,
 			getContextUsage: () => this.#getContextUsageFn(),
@@ -390,9 +394,6 @@ export class ExtensionRunner {
 			modelRegistry: this.modelRegistry,
 			get model() {
 				return getModel();
-			},
-			get searchDb() {
-				return getSearchDb();
 			},
 			isIdle: () => this.#isIdleFn(),
 			abort: () => this.#abortFn(),
@@ -555,53 +556,35 @@ export class ExtensionRunner {
 	}
 
 	async emitUserBash(event: UserBashEvent): Promise<UserBashEventResult | undefined> {
-		const ctx = this.createContext();
-
-		for (const ext of this.extensions) {
-			const handlers = ext.handlers.get("user_bash");
-			if (!handlers || handlers.length === 0) continue;
-
-			for (const handler of handlers) {
-				try {
-					const handlerResult = await handler(event, ctx);
-					if (handlerResult) {
-						return handlerResult as UserBashEventResult;
-					}
-				} catch (err) {
-					const message = err instanceof Error ? err.message : String(err);
-					const stack = err instanceof Error ? err.stack : undefined;
-					this.emitError({
-						extensionPath: ext.path,
-						event: "user_bash",
-						error: message,
-						stack,
-					});
-				}
-			}
-		}
-
-		return undefined;
+		return this.emitUserEvent<UserBashEventResult>(event, "user_bash");
 	}
 
 	async emitUserPython(event: UserPythonEvent): Promise<UserPythonEventResult | undefined> {
+		return this.emitUserEvent<UserPythonEventResult>(event, "user_python");
+	}
+
+	private async emitUserEvent<R>(
+		event: UserBashEvent | UserPythonEvent,
+		eventName: "user_bash" | "user_python",
+	): Promise<R | undefined> {
 		const ctx = this.createContext();
 
 		for (const ext of this.extensions) {
-			const handlers = ext.handlers.get("user_python");
+			const handlers = ext.handlers.get(eventName);
 			if (!handlers || handlers.length === 0) continue;
 
 			for (const handler of handlers) {
 				try {
 					const handlerResult = await handler(event, ctx);
 					if (handlerResult) {
-						return handlerResult as UserPythonEventResult;
+						return handlerResult as R;
 					}
 				} catch (err) {
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
 					this.emitError({
 						extensionPath: ext.path,
-						event: "user_python",
+						event: eventName,
 						error: message,
 						stack,
 					});
@@ -695,7 +678,26 @@ export class ExtensionRunner {
 
 	async emitContext(messages: AgentMessage[]): Promise<AgentMessage[]> {
 		const ctx = this.createContext();
-		let currentMessages = structuredClone(messages);
+
+		// Check if any extensions actually have context handlers before cloning
+		let hasContextHandlers = false;
+		for (const ext of this.extensions) {
+			if (ext.handlers.get("context")?.length) {
+				hasContextHandlers = true;
+				break;
+			}
+		}
+		if (!hasContextHandlers) return messages;
+
+		let currentMessages: AgentMessage[];
+		try {
+			currentMessages = structuredClone(messages);
+		} catch {
+			// Messages may contain non-cloneable objects (e.g. in ToolResultMessage.details
+			// or ProviderPayload). Fall back to a shallow array clone — extensions should
+			// return new message arrays rather than mutating in place.
+			currentMessages = [...messages];
+		}
 
 		for (const ext of this.extensions) {
 			const handlers = ext.handlers.get("context");
@@ -757,6 +759,37 @@ export class ExtensionRunner {
 		}
 
 		return currentPayload;
+	}
+
+	async emitAfterProviderResponse(response: ProviderResponseMetadata, _model?: Model): Promise<void> {
+		const ctx = this.createContext();
+
+		for (const ext of this.extensions) {
+			const handlers = ext.handlers.get("after_provider_response");
+			if (!handlers || handlers.length === 0) continue;
+
+			for (const handler of handlers) {
+				try {
+					const event: AfterProviderResponseEvent = {
+						type: "after_provider_response",
+						status: response.status,
+						headers: response.headers,
+						requestId: response.requestId,
+						metadata: response.metadata,
+					};
+					await handler(event, ctx);
+				} catch (err) {
+					const message = err instanceof Error ? err.message : String(err);
+					const stack = err instanceof Error ? err.stack : undefined;
+					this.emitError({
+						extensionPath: ext.path,
+						event: "after_provider_response",
+						error: message,
+						stack,
+					});
+				}
+			}
+		}
 	}
 
 	async emitBeforeAgentStart(

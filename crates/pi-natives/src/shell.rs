@@ -26,6 +26,8 @@ use std::{
 #[cfg(windows)]
 mod windows;
 
+mod minimizer;
+
 use brush_builtins::{BuiltinSet, default_builtins};
 use brush_core::{
 	CreateOptions, ExecutionContext, ExecutionControlFlow, ExecutionExitCode, ExecutionResult,
@@ -50,10 +52,7 @@ use tokio_util::sync::CancellationToken;
 #[cfg(windows)]
 use windows::configure_windows_path;
 
-use crate::task;
-
-const TERM_SIGNAL: i32 = 15;
-const KILL_SIGNAL: i32 = 9;
+use crate::{ps, task};
 
 struct ShellSessionCore {
 	shell: BrushShell,
@@ -83,6 +82,7 @@ impl ShellAbortState {
 struct ShellConfig {
 	session_env:   Option<HashMap<String, String>>,
 	snapshot_path: Option<String>,
+	minimizer:     Option<minimizer::MinimizerConfig>,
 }
 
 /// Options for configuring a persistent shell session.
@@ -92,16 +92,20 @@ pub struct ShellOptions {
 	pub session_env:   Option<HashMap<String, String>>,
 	/// Optional snapshot file to source on session creation.
 	pub snapshot_path: Option<String>,
+	/// Optional per-command output minimizer configuration.
+	pub minimizer:     Option<minimizer::MinimizerOptions>,
 }
 
 /// Options for running a shell command (internal, lifetime-free).
 struct ShellRunConfig {
 	/// Command string to execute in the shell.
-	command: String,
+	command:   String,
 	/// Working directory for the command.
-	cwd:     Option<String>,
+	cwd:       Option<String>,
 	/// Environment variables to apply for this command only.
-	env:     Option<HashMap<String, String>>,
+	env:       Option<HashMap<String, String>>,
+	/// Resolved output minimizer config for this command.
+	minimizer: Option<minimizer::MinimizerConfig>,
 }
 
 /// Options for running a shell command.
@@ -114,10 +118,33 @@ pub struct ShellRunOptions<'env> {
 	/// Environment variables to apply for this command only.
 	pub env:        Option<HashMap<String, String>>,
 	/// Timeout in milliseconds before cancelling the command.
-	#[napi(js_name = "timeoutMs")]
 	pub timeout_ms: Option<u32>,
 	/// Abort signal for cancelling the operation.
 	pub signal:     Option<Unknown<'env>>,
+}
+
+/// Telemetry for a single minimization.
+///
+/// Surfaced when the minimizer actually rewrote the command's output. The
+/// session layer is expected to persist `original_text` via its
+/// `ArtifactManager`, splice the resulting `artifact://<id>` reference
+/// into `text`, and replace any previously streamed raw output with the
+/// minimized text.
+#[napi(object)]
+pub struct MinimizerResult {
+	/// Dispatch label produced by the minimizer (e.g. `"git"`,
+	/// `"pipeline:gradle"`, `"pipeline+builtin"`).
+	pub filter:        String,
+	/// The minimized replacement text. Callers that streamed raw chunks
+	/// during execution should clear and replace their accumulated output
+	/// with this text.
+	pub text:          String,
+	/// The full original capture, before minimization.
+	pub original_text: String,
+	/// Captured byte length before minimization.
+	pub input_bytes:   u32,
+	/// Byte length of the minimized text the consumer received.
+	pub output_bytes:  u32,
 }
 
 /// Result of running a shell command.
@@ -129,6 +156,11 @@ pub struct ShellRunResult {
 	pub cancelled: bool,
 	/// Whether the command timed out before completion.
 	pub timed_out: bool,
+	/// When the minimizer rewrote the captured output, this carries the
+	/// original buffer + telemetry so the session layer can persist it as
+	/// an artifact and splice an `artifact://<id>` reference into the
+	/// minimized text shown to the agent. `None` when nothing was rewritten.
+	pub minimized: Option<MinimizerResult>,
 }
 
 /// Persistent brush-core shell session.
@@ -146,10 +178,20 @@ impl Shell {
 	///
 	/// The options set session-scoped environment variables and a snapshot path.
 	pub fn new(options: Option<ShellOptions>) -> Self {
-		let config = options.map_or_else(
-			|| ShellConfig { session_env: None, snapshot_path: None },
-			|opt| ShellConfig { session_env: opt.session_env, snapshot_path: opt.snapshot_path },
-		);
+		let config = match options {
+			None => ShellConfig { session_env: None, snapshot_path: None, minimizer: None },
+			Some(opt) => {
+				let minimizer = opt
+					.minimizer
+					.as_ref()
+					.map(minimizer::MinimizerConfig::from_options);
+				ShellConfig {
+					session_env: opt.session_env,
+					snapshot_path: opt.snapshot_path,
+					minimizer,
+				}
+			},
+		};
 		Self {
 			session: Arc::new(TokioMutex::new(None)),
 			abort_state: ShellAbortState::default(),
@@ -167,17 +209,20 @@ impl Shell {
 		&self,
 		env: &'e Env,
 		options: ShellRunOptions<'e>,
-		#[napi(ts_arg_type = "((chunk: string) => void) | undefined | null")] on_chunk: Option<
-			ThreadsafeFunction<String>,
-		>,
+		#[napi(ts_arg_type = "((error: Error | null, chunk: string) => void) | undefined | null")]
+		on_chunk: Option<ThreadsafeFunction<String>>,
 	) -> Result<PromiseRaw<'e, ShellRunResult>> {
 		let ct = task::CancelToken::new(options.timeout_ms, options.signal);
 		let session = self.session.clone();
 		let abort_state = self.abort_state.clone();
 		let config = self.config.clone();
 
-		let run_config =
-			ShellRunConfig { command: options.command, cwd: options.cwd, env: options.env };
+		let run_config = ShellRunConfig {
+			command:   options.command,
+			cwd:       options.cwd,
+			env:       options.env,
+			minimizer: config.minimizer.clone(),
+		};
 
 		task::future(env, "shell.run", async move {
 			run_shell_session(session, abort_state, config, run_config, on_chunk, ct).await
@@ -242,6 +287,7 @@ async fn run_shell_session(
 				exit_code: None,
 				cancelled: matches!(reason, task::AbortReason::Signal),
 				timed_out: matches!(reason, task::AbortReason::Timeout),
+				minimized: None,
 			});
 		}
 	};
@@ -249,11 +295,17 @@ async fn run_shell_session(
 		res.unwrap_or_else(|e| Err(Error::from_reason(format!("Shell execution task failed: {e}"))));
 	abort_state.clear().await;
 
-	let keepalive = res.as_ref().is_ok_and(session_keepalive);
+	let keepalive = res.as_ref().is_ok_and(|pair| session_keepalive(&pair.0));
 	if !keepalive {
 		*session.lock().await = None;
 	}
-	Ok(ShellRunResult { exit_code: Some(exit_code(&res?)), cancelled: false, timed_out: false })
+	let (exec, minimized) = res?;
+	Ok(ShellRunResult {
+		exit_code: Some(exit_code(&exec)),
+		cancelled: false,
+		timed_out: false,
+		minimized,
+	})
 }
 
 /// Options for executing a shell command via brush-core.
@@ -268,11 +320,11 @@ pub struct ShellExecuteOptions<'env> {
 	/// Environment variables to apply once per session.
 	pub session_env:   Option<HashMap<String, String>>,
 	/// Timeout in milliseconds before cancelling the command.
-	#[napi(js_name = "timeoutMs")]
 	pub timeout_ms:    Option<u32>,
 	/// Optional snapshot file to source on session creation.
-	#[napi(js_name = "snapshotPath")]
 	pub snapshot_path: Option<String>,
+	/// Optional per-command output minimizer configuration.
+	pub minimizer:     Option<minimizer::MinimizerOptions>,
 	/// Abort signal for cancelling the operation.
 	pub signal:        Option<Unknown<'env>>,
 }
@@ -286,6 +338,8 @@ pub struct ShellExecuteResult {
 	pub cancelled: bool,
 	/// Whether the command timed out before completion.
 	pub timed_out: bool,
+	/// See [`ShellRunResult::minimized`].
+	pub minimized: Option<MinimizerResult>,
 }
 
 /// Execute a brush shell command.
@@ -293,18 +347,24 @@ pub struct ShellExecuteResult {
 /// Creates a fresh session for each call. The `on_chunk` callback receives
 /// streamed stdout/stderr output. Returns the exit code when the command
 /// completes, or flags when cancelled or timed out.
-#[napi(js_name = "executeShell")]
+#[napi]
 pub fn execute_shell<'env>(
 	env: &'env Env,
 	options: ShellExecuteOptions<'env>,
-	#[napi(ts_arg_type = "((chunk: string) => void) | undefined | null")] on_chunk: Option<
-		ThreadsafeFunction<String>,
-	>,
+	#[napi(ts_arg_type = "((error: Error | null, chunk: string) => void) | undefined | null")]
+	on_chunk: Option<ThreadsafeFunction<String>>,
 ) -> Result<PromiseRaw<'env, ShellExecuteResult>> {
-	let config =
-		ShellConfig { session_env: options.session_env, snapshot_path: options.snapshot_path };
+	let minimizer = options
+		.minimizer
+		.as_ref()
+		.map(minimizer::MinimizerConfig::from_options);
+	let config = ShellConfig {
+		session_env:   options.session_env,
+		snapshot_path: options.snapshot_path,
+		minimizer:     minimizer.clone(),
+	};
 	let run_config =
-		ShellRunConfig { command: options.command, cwd: options.cwd, env: options.env };
+		ShellRunConfig { command: options.command, cwd: options.cwd, env: options.env, minimizer };
 
 	let ct = task::CancelToken::new(options.timeout_ms, options.signal);
 	task::future(env, "shell.execute", async move {
@@ -342,6 +402,7 @@ async fn run_shell_oneshot(
 				exit_code: None,
 				cancelled: matches!(reason, task::AbortReason::Signal),
 				timed_out: matches!(reason, task::AbortReason::Timeout),
+				minimized: None,
 			})
 		},
 	};
@@ -349,7 +410,13 @@ async fn run_shell_oneshot(
 	let res = run_result
 		.unwrap_or_else(|e| Err(Error::from_reason(format!("Shell execution task failed: {e}"))));
 
-	Ok(ShellExecuteResult { exit_code: Some(exit_code(&res?)), cancelled: false, timed_out: false })
+	let (exec, minimized) = res?;
+	Ok(ShellExecuteResult {
+		exit_code: Some(exit_code(&exec)),
+		cancelled: false,
+		timed_out: false,
+		minimized,
+	})
 }
 
 fn null_file() -> Result<OpenFile> {
@@ -534,7 +601,7 @@ async fn run_shell_command(
 	options: &ShellRunConfig,
 	on_chunk: Option<ThreadsafeFunction<String>>,
 	cancel_token: CancellationToken,
-) -> Result<ExecutionResult> {
+) -> Result<(ExecutionResult, Option<MinimizerResult>)> {
 	if let Some(cwd) = options.cwd.as_deref() {
 		session
 			.shell
@@ -580,13 +647,43 @@ async fn run_shell_command(
 		}
 	}
 
+	let minimizer_mode = if let Some(config) = options.minimizer.as_ref() {
+		minimizer::engine::mode_for(&options.command, config)
+	} else {
+		minimizer::engine::MinimizerMode::None
+	};
+	let should_minimize = !matches!(minimizer_mode, minimizer::engine::MinimizerMode::None);
+	let max_capture_bytes = if let Some(config) = options.minimizer.as_ref() {
+		config.max_capture_bytes as usize
+	} else {
+		0
+	};
+
 	let reader_cancel = CancellationToken::new();
 	let (activity_tx, mut activity_rx) = mpsc::channel::<()>(1);
+	// Stream every raw chunk to the caller live, regardless of whether
+	// minimization is enabled. When minimization actually transforms the
+	// output, we propagate the replacement text via `MinimizerResult.text`
+	// so the caller can swap their accumulated buffer for the minimized
+	// version without losing intermediate progress updates.
+	let reader_callback = on_chunk;
 	let mut reader_handle = tokio::spawn({
 		let reader_cancel = reader_cancel.clone();
 		async move {
-			Box::pin(read_output(reader_file, on_chunk, reader_cancel, activity_tx)).await;
-			Result::<()>::Ok(())
+			if should_minimize {
+				let output = read_output_buffered(
+					reader_file,
+					reader_callback,
+					reader_cancel,
+					activity_tx,
+					max_capture_bytes,
+				)
+				.await;
+				Result::<OutputRead>::Ok(OutputRead::Buffered(output))
+			} else {
+				Box::pin(read_output(reader_file, reader_callback, reader_cancel, activity_tx)).await;
+				Result::<OutputRead>::Ok(OutputRead::Streaming)
+			}
 		}
 	});
 	let cancel_bridge = tokio::spawn({
@@ -624,13 +721,16 @@ async fn run_shell_command(
 	const READER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 
 	let mut reader_finished = false;
+	let mut reader_output = None;
 	let mut idle_timer = Box::pin(time::sleep(POST_EXIT_IDLE));
 	let mut max_timer = Box::pin(time::sleep(POST_EXIT_MAX));
 
 	loop {
 		tokio::select! {
 			res = &mut reader_handle => {
-				let _ = res;
+				if let Ok(Ok(output)) = res {
+					reader_output = Some(output);
+				}
 				reader_finished = true;
 				break;
 			}
@@ -648,7 +748,11 @@ async fn run_shell_command(
 	if !reader_finished {
 		reader_cancel.cancel();
 		if let Ok(res) = time::timeout(READER_SHUTDOWN_TIMEOUT, &mut reader_handle).await {
-			let _ = res;
+			if let Ok(output) = res
+				&& let Ok(output) = output
+			{
+				reader_output = Some(output);
+			}
 		} else {
 			reader_handle.abort();
 			let _ = reader_handle.await;
@@ -657,79 +761,60 @@ async fn run_shell_command(
 	cancel_bridge.abort();
 	let _ = cancel_bridge.await;
 
-	result.map_err(|err| Error::from_reason(format!("Shell execution failed: {err}")))
+	let result =
+		result.map_err(|err| Error::from_reason(format!("Shell execution failed: {err}")))?;
+	let mut minimized_out: Option<MinimizerResult> = None;
+	if let Some(OutputRead::Buffered(output)) = reader_output
+		&& let Some(config) = options.minimizer.as_ref()
+		&& !output.exceeded
+	{
+		let minimized = match minimizer_mode {
+			minimizer::engine::MinimizerMode::WholeCommand => {
+				minimizer::apply(&options.command, &output.text, exit_code(&result), config)
+			},
+			minimizer::engine::MinimizerMode::None => {
+				minimizer::MinimizerOutput::passthrough(&output.text)
+			},
+		};
+		if minimized.changed
+			&& let Some(original) = minimized.original_text
+		{
+			let output_bytes = u32::try_from(minimized.text.len()).unwrap_or(u32::MAX);
+			minimized_out = Some(MinimizerResult {
+				filter: minimized.filter.to_string(),
+				text: minimized.text,
+				original_text: original,
+				input_bytes: u32::try_from(minimized.input_bytes).unwrap_or(u32::MAX),
+				output_bytes,
+			});
+		}
+	}
+	Ok((result, minimized_out))
 }
 
-#[cfg(unix)]
 fn terminate_background_jobs(shell: &BrushShell) {
 	if shell.jobs.jobs.is_empty() {
 		return;
 	}
-	let mut pgids = Vec::new();
-	let mut pids = Vec::new();
+	let mut targets = ps::TerminationTargets::new();
 	for job in &shell.jobs.jobs {
-		if let Some(pgid) = job.process_group_id()
-			&& !pgids.contains(&pgid)
-		{
-			pgids.push(pgid);
+		if let Some(pgid) = job.process_group_id() {
+			targets.add_pgid(pgid);
 		}
-		if let Some(pid) = job.representative_pid()
-			&& !pids.contains(&pid)
-		{
-			pids.push(pid);
+		if let Some(pid) = job.representative_pid() {
+			targets.add_pid(pid);
 		}
 	}
-	if pgids.is_empty() && pids.is_empty() {
+	if targets.is_empty() {
 		return;
 	}
 
-	for &pgid in &pgids {
-		let _ = crate::ps::kill_process_group(pgid, TERM_SIGNAL);
-	}
-	for &pid in &pids {
-		let _ = crate::ps::kill_tree(pid, TERM_SIGNAL);
-	}
-
+	targets.signal(ps::TERM_SIGNAL);
 	tokio::spawn(async move {
 		time::sleep(Duration::from_millis(500)).await;
-		for pid in pgids {
-			let _ = crate::ps::kill_process_group(pid, KILL_SIGNAL);
-		}
-		for pid in pids {
-			let _ = crate::ps::kill_tree(pid, KILL_SIGNAL);
-		}
+		targets.signal(ps::KILL_SIGNAL);
 	});
 }
-
-#[cfg(windows)]
-fn terminate_background_jobs(shell: &BrushShell) {
-	if shell.jobs.jobs.is_empty() {
-		return;
-	}
-	let mut pids = Vec::new();
-	for job in &shell.jobs.jobs {
-		if let Some(pid) = job.representative_pid()
-			&& !pids.contains(&pid)
-		{
-			pids.push(pid);
-		}
-	}
-	if pids.is_empty() {
-		return;
-	}
-
-	for &pid in &pids {
-		let _ = crate::ps::kill_tree(pid, TERM_SIGNAL);
-	}
-
-	tokio::spawn(async move {
-		time::sleep(Duration::from_millis(500)).await;
-		for pid in pids {
-			let _ = crate::ps::kill_tree(pid, KILL_SIGNAL);
-		}
-	});
-}
-
 fn should_skip_env_var(key: &str) -> bool {
 	if key.starts_with("BASH_FUNC_") && key.ends_with("%%") {
 		return true;
@@ -796,6 +881,16 @@ const fn session_keepalive(result: &ExecutionResult) -> bool {
 		ExecutionControlFlow::ReturnFromFunctionOrScript => false,
 		ExecutionControlFlow::ExitShell => false,
 	}
+}
+
+enum OutputRead {
+	Streaming,
+	Buffered(BufferedOutput),
+}
+
+struct BufferedOutput {
+	text:     String,
+	exceeded: bool,
 }
 
 async fn read_output(
@@ -904,6 +999,126 @@ async fn read_output(
 			emit_chunk(REPLACEMENT, on_chunk.as_ref());
 		}
 	}
+}
+
+async fn read_output_buffered(
+	reader: fs::File,
+	on_chunk: Option<ThreadsafeFunction<String>>,
+	cancel_token: CancellationToken,
+	activity: mpsc::Sender<()>,
+	max_capture_bytes: usize,
+) -> BufferedOutput {
+	const REPLACEMENT: &str = "\u{FFFD}";
+	const BUF: usize = 65536;
+	let mut buf = vec![0u8; BUF];
+	let mut captured = Vec::new();
+	let mut exceeded = false;
+	// Pending bytes from a prior read that ended mid-UTF-8 sequence. We hold
+	// them back so we emit only valid UTF-8 to the streaming callback while
+	// still capturing every byte into `captured` for post-processing.
+	let mut pending = Vec::<u8>::new();
+
+	#[cfg(unix)]
+	let Ok(reader) = register_nonblocking_pipe(reader) else {
+		return BufferedOutput { text: String::new(), exceeded: true };
+	};
+	#[cfg(not(unix))]
+	let reader = tokio::fs::File::from_std(reader);
+	#[cfg(not(unix))]
+	tokio::pin!(reader);
+
+	loop {
+		#[cfg(unix)]
+		let n = {
+			let Ok(mut readiness) = (tokio::select! {
+				ready = reader.readable() => ready,
+				() = cancel_token.cancelled() => break,
+			}) else {
+				break;
+			};
+			match readiness.try_io(|inner| read_nonblocking(inner.get_ref(), &mut buf)) {
+				Ok(Ok(0)) => break,
+				Ok(Ok(n)) => n,
+				Ok(Err(e)) if e.kind() == io::ErrorKind::Interrupted => continue,
+				Ok(Err(_)) => break,
+				Err(_would_block) => continue,
+			}
+		};
+		#[cfg(not(unix))]
+		let n = {
+			let read_future = reader.read(&mut buf);
+			tokio::pin!(read_future);
+			match tokio::select! {
+				res = &mut read_future => res,
+				() = cancel_token.cancelled() => break,
+			} {
+				Ok(0) => break,
+				Ok(n) => n,
+				Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+				Err(_) => break,
+			}
+		};
+		if n > 0 {
+			let _ = activity.try_send(());
+		}
+		// Once `exceeded`, the post-process minimizer is bypassed (see the
+		// `!output.exceeded` gate at the call site), so further appends just
+		// grow `captured` without serving any purpose. Stop accumulating to
+		// bound peak memory on commands that produce very large output.
+		if !exceeded {
+			if captured.len().saturating_add(n) > max_capture_bytes {
+				exceeded = true;
+			} else {
+				captured.extend_from_slice(&buf[..n]);
+			}
+		}
+
+		// Stream whatever is validly decodable *right now* to the callback,
+		// carrying incomplete trailing UTF-8 bytes over to the next iteration.
+		if let Some(cb) = on_chunk.as_ref() {
+			pending.extend_from_slice(&buf[..n]);
+			while !pending.is_empty() {
+				match str::from_utf8(&pending) {
+					Ok(text) => {
+						emit_chunk(text, Some(cb));
+						pending.clear();
+						break;
+					},
+					Err(err) => {
+						let p = err.valid_up_to();
+						if p > 0 {
+							// SAFETY: [..p] is valid UTF-8 per valid_up_to().
+							let text = unsafe { str::from_utf8_unchecked(&pending[..p]) };
+							emit_chunk(text, Some(cb));
+							pending.drain(..p);
+						}
+						match err.error_len() {
+							Some(skip) => {
+								emit_chunk(REPLACEMENT, Some(cb));
+								pending.drain(..skip);
+							},
+							None => break,
+						}
+					},
+				}
+			}
+		}
+	}
+
+	// Flush any trailing bytes the streaming decoder held back at EOF.
+	if let Some(cb) = on_chunk.as_ref() {
+		for chunk in pending.utf8_chunks() {
+			let valid = chunk.valid();
+			if !valid.is_empty() {
+				emit_chunk(valid, Some(cb));
+			}
+			if !chunk.invalid().is_empty() {
+				emit_chunk(REPLACEMENT, Some(cb));
+			}
+		}
+	}
+
+	BufferedOutput { text: String::from_utf8_lossy(&captured).into_owned(), exceeded }
 }
 
 #[cfg(unix)]
@@ -1136,6 +1351,184 @@ fn quote_arg(arg: &str) -> String {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// Truth-table coverage for `brush_core::commands::child_session_action`.
+	///
+	/// Lives in `pi-natives` because the brush-core crate is excluded from the
+	/// workspace (vendored upstream) and cannot be tested standalone — its tokio
+	/// dependency only resolves the `net` feature via feature-unification with
+	/// other workspace members.
+	mod child_session_action {
+		use brush_core::commands::{ChildSessionAction, child_session_action};
+
+		/// Interactive brush, leading its own pgroup, terminal stdin: foreground.
+		#[test]
+		fn interactive_with_terminal_stdin_takes_foreground() {
+			assert_eq!(child_session_action(true, true, false), ChildSessionAction::TakeForeground,);
+			// `in_pipeline_group` is meaningless when `new_pg` is true; result MUST
+			// not depend on it.
+			assert_eq!(child_session_action(true, true, true), ChildSessionAction::TakeForeground,);
+		}
+
+		/// Interactive brush leading its own pgroup but with non-terminal stdin
+		/// (e.g. redirected): detach so SIGTTIN/SIGTTOU on the inherited tty
+		/// cannot stop the parent.
+		#[test]
+		fn interactive_with_non_terminal_stdin_detaches() {
+			assert_eq!(child_session_action(true, false, false), ChildSessionAction::DetachSession,);
+			assert_eq!(child_session_action(true, false, true), ChildSessionAction::DetachSession,);
+		}
+
+		/// Non-interactive brush, terminal stdin, no pipeline: nothing to do.
+		#[test]
+		fn non_interactive_with_terminal_stdin_does_nothing() {
+			assert_eq!(child_session_action(false, true, false), ChildSessionAction::None,);
+		}
+
+		/// Non-interactive brush, terminal stdin, joining a pipeline pgroup:
+		/// nothing to do (parent already wired pgroup membership).
+		#[test]
+		fn non_interactive_terminal_stdin_in_pipeline_does_nothing() {
+			assert_eq!(child_session_action(false, true, true), ChildSessionAction::None,);
+		}
+
+		/// **Embedded host bug fix.** Non-interactive brush, non-terminal stdin,
+		/// no pipeline pgroup: detach so the child cannot SIGTTIN/SIGTTOU the
+		/// host. This is the case that regressed before this fix and is the
+		/// motivating bug for PR #895.
+		#[test]
+		fn embedded_host_with_non_terminal_stdin_detaches() {
+			assert_eq!(child_session_action(false, false, false), ChildSessionAction::DetachSession,);
+		}
+
+		/// **Pipeline carve-out.** Non-interactive brush, non-terminal stdin
+		/// (pipe), joining an established pipeline pgroup: MUST NOT detach.
+		/// `setsid()` would either fail with EPERM or move the child into a new
+		/// session, breaking the pipeline's shared process group and its
+		/// job-control signal propagation. This is the regression Codex flagged
+		/// in PR #895.
+		#[test]
+		fn pipeline_stage_does_not_detach() {
+			assert_eq!(child_session_action(false, false, true), ChildSessionAction::None,);
+		}
+	}
+
+	/// End-to-end verification that brush, when embedded as a non-interactive
+	/// library (`interactive: false`, exactly what `create_session` produces),
+	/// spawns external commands in a **separate session** from the host.
+	///
+	/// The truth-table tests in `child_session_action` cover the decision in
+	/// isolation. This test covers the wiring: it boots a real `BrushShell`,
+	/// runs a child that prints its PID then sleeps, and asks the kernel for
+	/// that PID's session via `getsid(2)` while the child is still alive.
+	/// Pre-fix (`new_pg=false` skipped `detach_session`), the child inherited
+	/// the host's session, so `getsid(child_pid) == getsid(0)`. Post-fix,
+	/// `setsid` ran and the child is its own session leader
+	/// (`getsid(child_pid) == child_pid`).
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn embedded_external_command_runs_in_its_own_session() {
+		use std::io::Read as _;
+
+		// SAFETY: `getsid(0)` only queries the current process session; the return
+		// value is checked.
+		let host_sid = unsafe { libc::getsid(0) };
+		assert!(host_sid > 0, "getsid(0) failed: {}", std::io::Error::last_os_error());
+
+		// Build the same kind of session pi-natives uses in production.
+		let config = ShellConfig { session_env: None, snapshot_path: None, minimizer: None };
+		let mut session = create_session(&config).await.expect("create_session");
+
+		// Output pipe shared between the brush child and a concurrent reader. The
+		// reader runs on a blocking thread because `os_pipe` reads are blocking.
+		let (mut reader, writer) = pipe_to_files("e2e").expect("pipe");
+		let stdout_file = OpenFile::from(writer.try_clone().expect("clone"));
+		let stderr_file = OpenFile::from(writer);
+
+		let mut params = session.shell.default_exec_params();
+		params.set_fd(OpenFiles::STDIN_FD, null_file().expect("null stdin"));
+		params.set_fd(OpenFiles::STDOUT_FD, stdout_file);
+		params.set_fd(OpenFiles::STDERR_FD, stderr_file);
+
+		// (pid_tx, pid_rx) — reader task signals the test as soon as it has the PID.
+		let (pid_tx, pid_rx) = tokio::sync::oneshot::channel::<i32>();
+		let reader_handle = tokio::task::spawn_blocking(move || {
+			let mut buf = Vec::new();
+			// Read just enough to capture the PID line. The child sleeps after
+			// printing so the pipe will not back-pressure.
+			let mut chunk = [0u8; 64];
+			let mut pid_tx = Some(pid_tx);
+			while let Ok(n) = reader.read(&mut chunk)
+				&& n > 0
+			{
+				buf.extend_from_slice(&chunk[..n]);
+				if pid_tx.is_some()
+					&& let Some(line_end) = buf.iter().position(|&byte| byte == b'\n')
+					&& let Ok(line) = std::str::from_utf8(&buf[..line_end])
+					&& let Ok(pid) = line.trim().parse::<i32>()
+				{
+					let _ = pid_tx
+						.take()
+						.expect("pid sender should be present")
+						.send(pid);
+				}
+			}
+			buf
+		});
+
+		// Run brush in the background so we can call `getsid(child_pid)` while
+		// the child is still alive.
+		let shell_handle = tokio::spawn(async move {
+			// `printf '%d\n' "$$"` then `sleep 0.5`. Long enough for our `getsid`.
+			let exec = session
+				.shell
+				.run_string("/bin/sh -c 'printf \"%d\\n\" \"$$\"; sleep 0.5'", &params)
+				.await
+				.expect("run_string");
+			drop(params);
+			(session, exec)
+		});
+
+		let child_pid = time::timeout(Duration::from_secs(5), pid_rx)
+			.await
+			.expect("timed out waiting for child PID")
+			.expect("reader closed pid channel without sending");
+		assert!(child_pid > 0, "got non-positive child pid: {child_pid}");
+
+		// Snapshot the child's session ID immediately, while the child is still
+		// in `sleep`. POSIX guarantees `getsid` against a live PID returns the
+		// session of that process.
+		// SAFETY: `child_pid` is a positive PID from the child; errors are reported via
+		// the checked return value.
+		let child_sid = unsafe { libc::getsid(child_pid) };
+		assert!(
+			child_sid > 0,
+			"getsid({child_pid}) failed: {} (child may have already exited)",
+			std::io::Error::last_os_error(),
+		);
+
+		// Drain the brush task and the pipe reader.
+		let (_session, exec) = time::timeout(Duration::from_secs(5), shell_handle)
+			.await
+			.expect("shell timed out")
+			.expect("shell task panicked");
+		assert!(
+			matches!(exec.exit_code, ExecutionExitCode::Success),
+			"unexpected exit: {}",
+			exit_code(&exec),
+		);
+		let _ = time::timeout(Duration::from_secs(2), reader_handle).await;
+
+		assert_ne!(
+			child_sid, host_sid,
+			"child PID {child_pid} inherited host session {host_sid}; setsid() did not run — the \
+			 embedded-host bug is back",
+		);
+		assert_eq!(
+			child_sid, child_pid,
+			"child PID {child_pid} should be its own session leader after setsid",
+		);
+	}
 
 	#[tokio::test]
 	async fn abort_state_signals_cancel_token() {

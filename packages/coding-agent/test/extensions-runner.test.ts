@@ -421,6 +421,79 @@ describe("ExtensionRunner", () => {
 		});
 	});
 
+	describe("after_provider_response", () => {
+		it("calls handlers with response metadata and reports handler errors without throwing", async () => {
+			const eventsPath = path.join(tempDir.path(), "after-provider-response-events.jsonl");
+			const extCode = `
+			import * as fs from "node:fs";
+
+			export default function(pi) {
+				pi.on("after_provider_response", async (event) => {
+					fs.appendFileSync(
+						${JSON.stringify(eventsPath)},
+						JSON.stringify({
+							status: event.status,
+							headers: event.headers,
+							requestId: event.requestId,
+							metadata: event.metadata,
+						}) + "\\n",
+					);
+				});
+
+				pi.on("after_provider_response", async () => {
+					throw new Error("response failed");
+				});
+
+				pi.on("after_provider_response", async (event) => {
+					fs.appendFileSync(
+						${JSON.stringify(eventsPath)},
+						JSON.stringify({ afterError: event.status }) + "\\n",
+					);
+				});
+			}
+		`;
+			fs.writeFileSync(path.join(extensionsDir, "after-provider-response.ts"), extCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const errors: Array<{ extensionPath: string; event: string; error: string }> = [];
+			runner.onError(err => {
+				errors.push(err);
+			});
+
+			await runner.emitAfterProviderResponse({
+				status: 202,
+				headers: { "x-request-id": "req_123", "content-type": "text/event-stream" },
+				requestId: "req_123",
+				metadata: { provider: "test" },
+			});
+
+			const events = fs
+				.readFileSync(eventsPath, "utf8")
+				.trim()
+				.split("\n")
+				.map(line => JSON.parse(line));
+			expect(events).toEqual([
+				{
+					status: 202,
+					headers: { "x-request-id": "req_123", "content-type": "text/event-stream" },
+					requestId: "req_123",
+					metadata: { provider: "test" },
+				},
+				{ afterError: 202 },
+			]);
+			expect(errors).toHaveLength(1);
+			expect(errors[0]?.event).toBe("after_provider_response");
+			expect(errors[0]?.error).toContain("response failed");
+		});
+	});
+
 	describe("tool_result chaining", () => {
 		it("chains content modifications across handlers", async () => {
 			const extCode1 = `
@@ -522,6 +595,82 @@ describe("ExtensionRunner", () => {
 				details: { source: "ext1" },
 				isError: true,
 			});
+		});
+	});
+
+	describe("session name API", () => {
+		it("lets extensions read and set the session name after initialization", async () => {
+			const extCode = `
+				export default function(pi) {
+					pi.on("session_start", async () => {
+						if (pi.getSessionName() !== undefined) {
+							throw new Error("expected unnamed session");
+						}
+						await pi.setSessionName("Named by extension");
+					});
+				}
+			`;
+			const explicitExtensionPath = path.join(tempDir.path(), "session-name.ts");
+			fs.writeFileSync(explicitExtensionPath, extCode);
+
+			const result = await loadTestExtensions([explicitExtensionPath]);
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			runner.initialize(
+				{
+					sendMessage: () => {},
+					sendUserMessage: () => {},
+					appendEntry: () => {},
+					setLabel: () => {},
+					getActiveTools: () => [],
+					getAllTools: () => [],
+					setActiveTools: async () => {},
+					getCommands: () => [],
+					setModel: async () => false,
+					getThinkingLevel: () => undefined,
+					setThinkingLevel: () => {},
+					getSessionName: () => sessionManager.getSessionName(),
+					setSessionName: async name => {
+						await sessionManager.setSessionName(name);
+					},
+				},
+				{
+					getModel: () => undefined,
+					isIdle: () => true,
+					abort: () => {},
+					hasPendingMessages: () => false,
+					shutdown: () => {},
+					getContextUsage: () => undefined,
+					compact: async () => {},
+					getSystemPrompt: () => "",
+				},
+			);
+
+			await runner.emit({ type: "session_start" });
+
+			expect(sessionManager.getSessionName()).toBe("Named by extension");
+			expect(sessionManager.getHeader()?.title).toBe("Named by extension");
+		});
+
+		it("keeps session naming unavailable during extension load", async () => {
+			const extCode = `
+				export default function(pi) {
+					pi.getSessionName();
+				}
+			`;
+			const explicitExtensionPath = path.join(tempDir.path(), "session-name-load.ts");
+			fs.writeFileSync(explicitExtensionPath, extCode);
+
+			const result = await loadTestExtensions([explicitExtensionPath]);
+			const loadError = result.errors.find(error => error.path.includes("session-name-load.ts"));
+
+			expect(loadError).toBeDefined();
+			expect(loadError?.error).toContain("Extension runtime not initialized");
 		});
 	});
 

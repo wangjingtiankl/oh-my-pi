@@ -1,13 +1,14 @@
-import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { $ } from "bun";
+import { detectHostAvx2Support } from "../../../scripts/host-detect";
+import { generateEnumExports } from "./gen-enums";
 
 const repoRoot = path.join(import.meta.dir, "../../..");
 const rustDir = path.join(repoRoot, "crates/pi-natives");
 const nativeDir = path.join(import.meta.dir, "../native");
+const packageJsonPath = path.join(import.meta.dir, "../package.json");
 
-const isDev = process.argv.includes("--dev");
 const crossTarget = Bun.env.CROSS_TARGET;
 const targetPlatform = Bun.env.TARGET_PLATFORM || process.platform;
 const targetArch = Bun.env.TARGET_ARCH || process.arch;
@@ -27,48 +28,6 @@ if (configuredVariantRaw) {
 	configuredVariant = configuredVariantRaw;
 }
 
-function runCommand(command: string, args: string[]): string | null {
-	try {
-		const result = Bun.spawnSync([command, ...args], { stdout: "pipe", stderr: "pipe" });
-		if (result.exitCode !== 0) return null;
-		return result.stdout.toString("utf-8").trim();
-	} catch {
-		return null;
-	}
-}
-
-function detectHostAvx2Support(): boolean {
-	if (process.arch !== "x64") return false;
-
-	if (process.platform === "linux") {
-		try {
-			const cpuInfo = fsSync.readFileSync("/proc/cpuinfo", "utf8");
-			return /\bavx2\b/i.test(cpuInfo);
-		} catch {
-			return false;
-		}
-	}
-
-	if (process.platform === "darwin") {
-		const leaf7 = runCommand("sysctl", ["-n", "machdep.cpu.leaf7_features"]);
-		if (leaf7 && /\bAVX2\b/i.test(leaf7)) return true;
-		const features = runCommand("sysctl", ["-n", "machdep.cpu.features"]);
-		return Boolean(features && /\bAVX2\b/i.test(features));
-	}
-
-	if (process.platform === "win32") {
-		const output = runCommand("powershell.exe", [
-			"-NoProfile",
-			"-NonInteractive",
-			"-Command",
-			"[System.Runtime.Intrinsics.X86.Avx2]::IsSupported",
-		]);
-		return output?.toLowerCase() === "true";
-	}
-
-	return false;
-}
-
 function resolveEffectiveVariant(): X64Variant | null {
 	if (targetArch !== "x64") return null;
 	if (configuredVariant) return configuredVariant;
@@ -77,11 +36,11 @@ function resolveEffectiveVariant(): X64Variant | null {
 	}
 	return detectHostAvx2Support() ? "modern" : "baseline";
 }
-
 const effectiveVariant = resolveEffectiveVariant();
 const variantSuffix = effectiveVariant ? `-${effectiveVariant}` : "";
 
-// Default to native CPU optimization for local builds; explicit variants use fixed ISA targets.
+// Pin Rust target-cpu so x64 baseline/modern variants get a reproducible ISA floor
+// instead of inheriting the host CPU when RUSTFLAGS is unset.
 if (!isCrossCompile && !Bun.env.RUSTFLAGS) {
 	if (effectiveVariant === "modern") {
 		Bun.env.RUSTFLAGS = "-C target-cpu=x86-64-v3";
@@ -135,68 +94,130 @@ async function installBinary(src: string, dest: string): Promise<void> {
 		}
 	}
 }
+async function resolveBuiltAddonPath(outputDir: string, canonicalFilename: string): Promise<string> {
+	// napi-rs 3.x emits `${binaryName}.${platformArchABI}.node` where
+	// platformArchABI is e.g. `darwin-x64`, `linux-x64-gnu`, `win32-x64-msvc`,
+	// `darwin-arm64`. Build into an isolated output dir so only this invocation's
+	// outputs are considered fresh candidates.
+	const entries = await fs.readdir(outputDir);
 
-const isCI = Boolean(Bun.env.CI);
-const useLocalProfile = !isDev && !isCI && !isCrossCompile;
-const profile = isDev ? "dev" : useLocalProfile ? "local" : "release";
+	if (entries.includes(canonicalFilename)) {
+		return path.join(outputDir, canonicalFilename);
+	}
 
-const cargoArgs = ["build"];
-if (profile !== "dev") cargoArgs.push("--profile", profile);
-if (crossTarget) cargoArgs.push("--target", crossTarget);
+	const generatedCandidates = entries.filter(entry => {
+		if (!entry.startsWith(`pi_natives.${targetPlatform}-${targetArch}`) || !entry.endsWith(".node")) {
+			return false;
+		}
+		return true;
+	});
 
-const profileLabel = isDev ? " (debug)" : useLocalProfile ? " (local)" : "";
-console.log(`Building pi-natives for ${targetPlatform}-${targetArch}${variantSuffix}${profileLabel}…`);
-const buildResult = await $`cargo ${cargoArgs}`.cwd(rustDir).nothrow();
-if (buildResult.exitCode !== 0) {
-	const stderr = buildResult.stderr?.toString("utf-8") ?? "";
-	throw new Error(`cargo build --release failed${stderr ? `:\n${stderr}` : ""}`);
+	if (generatedCandidates.length === 1) {
+		return path.join(outputDir, generatedCandidates[0]);
+	}
+
+	if (generatedCandidates.length === 0) {
+		throw new Error(
+			`napi build succeeded but did not emit a native addon for ${targetPlatform}-${targetArch}. Expected ${canonicalFilename} or an environment-tagged variant in ${outputDir}. Directory contents: ${entries.join(", ") || "(empty)"}.`,
+		);
+	}
+
+	const formattedCandidates = generatedCandidates.map(candidate => `  - ${candidate}`).join("\n");
+	throw new Error(
+		`napi build emitted multiple unrecognized native addons for ${targetPlatform}-${targetArch}:\n${formattedCandidates}`,
+	);
 }
 
-// Cargo outputs "local" profile artifacts into the "local" directory
-const profileDir = isDev ? "debug" : useLocalProfile ? "local" : "release";
-const targetRoots = [
-	Bun.env.CARGO_TARGET_DIR ? path.resolve(Bun.env.CARGO_TARGET_DIR) : undefined,
-	path.join(repoRoot, "target"),
-	path.join(rustDir, "target"),
-].filter((v): v is string => Boolean(v));
+function resolveBuildOutputDirPrefix(profileLabel: string): string {
+	const buildTarget = crossTarget ?? `${targetPlatform}-${targetArch}`;
+	const variantLabel = effectiveVariant ?? "default";
+	return path.join(nativeDir, ".build", `${buildTarget}-${variantLabel}-${profileLabel}-`);
+}
 
-const profileDirs = targetRoots.flatMap(root => {
-	if (crossTarget) {
-		return [path.join(root, crossTarget, profileDir), path.join(root, profileDir)];
-	}
-	return [path.join(root, profileDir)];
-});
-
-const libraryNames = ["libpi_natives.so", "libpi_natives.dylib", "pi_natives.dll", "libpi_natives.dll"];
-
-let sourcePath: string | null = null;
-for (const dir of profileDirs) {
-	for (const name of libraryNames) {
-		const fullPath = path.join(dir, name);
+async function installGeneratedBindings(outputDir: string): Promise<void> {
+	for (const filename of ["index.js", "index.d.ts"]) {
+		const sourcePath = path.join(outputDir, filename);
+		const destPath = path.join(nativeDir, filename);
 		try {
-			await fs.stat(fullPath);
-			sourcePath = fullPath;
-			break;
+			await fs.copyFile(sourcePath, destPath);
 		} catch (err) {
-			if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+			const errno = err as NodeJS.ErrnoException;
+			if (errno.code === "ENOENT") {
+				const destExists = await Bun.file(destPath).exists();
+				if (destExists) {
+					continue;
+				}
+			}
+			const message = err instanceof Error ? err.message : String(err);
+			throw new Error(`Failed to install generated ${filename}: ${message}`);
 		}
 	}
-	if (sourcePath) break;
 }
+
+const isCI = Boolean(Bun.env.CI);
+const useLocalProfile = !isCI && !isCrossCompile;
+const profileLabel = useLocalProfile ? "local" : "ci";
+const profileSuffix = ` (${profileLabel})`;
+
+const buildOutputDirPrefix = resolveBuildOutputDirPrefix(profileLabel);
+
+// Build napi args
+const napiArgs = [
+	"build",
+	"--manifest-path",
+	path.join(rustDir, "Cargo.toml"),
+	"--package-json-path",
+	packageJsonPath,
+	"--platform",
+	"--no-js",
+	"--dts",
+	"index.d.ts",
+	"-o",
+	"",
+	"--profile",
+	profileLabel,
+];
+
+if (crossTarget) napiArgs.push("--target", crossTarget);
+
+const canonicalAddonFilename = `pi_natives.${targetPlatform}-${targetArch}${variantSuffix}.node`;
+const canonicalAddonPath = path.join(nativeDir, canonicalAddonFilename);
+
+console.log(`Building pi-natives for ${targetPlatform}-${targetArch}${variantSuffix}${profileSuffix}…`);
 
 await fs.mkdir(nativeDir, { recursive: true });
 await cleanupStaleTemps(nativeDir);
+await fs.mkdir(path.join(nativeDir, ".build"), { recursive: true });
+const buildOutputDir = await fs.mkdtemp(buildOutputDirPrefix);
+napiArgs[10] = buildOutputDir;
 
-if (!sourcePath) {
-	const checked = profileDirs.map(d => `  - ${d}`).join("\n");
-	throw new Error(`Built library not found. Checked:\n${checked}`);
+// Resolve napi bin directly: `bunx @napi-rs/cli` can pick up the wrong bin on
+// systems where `cli` exists on PATH (e.g. Mono's /usr/bin/cli on Ubuntu).
+const napiBin = Bun.which("napi", {
+	PATH: `${path.join(import.meta.dir, "..", "node_modules", ".bin")}:${path.join(repoRoot, "node_modules", ".bin")}:${process.env.PATH ?? ""}`,
+});
+if (!napiBin) {
+	throw new Error("Could not locate @napi-rs/cli `napi` binary in node_modules/.bin");
 }
 
-console.log(`Found: ${sourcePath}`);
-const taggedPath = isDev
-	? path.join(nativeDir, "pi_natives.dev.node")
-	: path.join(nativeDir, `pi_natives.${targetPlatform}-${targetArch}${variantSuffix}.node`);
-console.log(`Installing: ${taggedPath}`);
-await installBinary(sourcePath, taggedPath);
+try {
+	const buildResult = await $`${napiBin} ${napiArgs}`.nothrow();
+	if (buildResult.exitCode !== 0) {
+		const stderr = buildResult.stderr?.toString("utf-8") ?? "";
+		throw new Error(`napi build failed${stderr ? `:\n${stderr}` : ""}`);
+	}
 
-console.log("Build complete.");
+	const builtAddonPath = await resolveBuiltAddonPath(buildOutputDir, canonicalAddonFilename);
+	if (builtAddonPath !== canonicalAddonPath) {
+		console.log(`Normalizing native addon filename: ${path.basename(builtAddonPath)} → ${canonicalAddonFilename}`);
+		await installBinary(builtAddonPath, canonicalAddonPath);
+	}
+
+	await installGeneratedBindings(buildOutputDir);
+
+	await generateEnumExports();
+
+	console.log("Build complete.");
+} finally {
+	await fs.rm(buildOutputDir, { recursive: true, force: true });
+}

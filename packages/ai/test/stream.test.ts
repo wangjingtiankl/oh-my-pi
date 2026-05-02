@@ -7,6 +7,7 @@ import { getBundledModel } from "@oh-my-pi/pi-ai/models";
 import { complete, getEnvApiKey, stream } from "@oh-my-pi/pi-ai/stream";
 import type { Api, Context, ImageContent, Model, OptionsForApi, Tool, ToolResultMessage } from "@oh-my-pi/pi-ai/types";
 import { StringEnum } from "@oh-my-pi/pi-ai/utils/schema";
+import { $which } from "@oh-my-pi/pi-utils";
 import { Type } from "@sinclair/typebox";
 import { e2eApiKey, resolveApiKey } from "./oauth";
 
@@ -587,7 +588,7 @@ describe("Generate E2E Tests", () => {
 
 	describe.skipIf(!e2eApiKey("OPENAI_API_KEY"))("OpenAI Completions Provider (gpt-4o-mini)", () => {
 		const llm: Model<"openai-completions"> = {
-			...getBundledModel("openai", "gpt-4o-mini"),
+			...(getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions">),
 			api: "openai-completions",
 		};
 
@@ -625,7 +626,7 @@ describe("Generate E2E Tests", () => {
 	});
 
 	describe.skipIf(!e2eApiKey("OPENAI_API_KEY"))("OpenAI Responses Provider (gpt-5-mini)", () => {
-		const llm = getBundledModel("openai", "gpt-5-mini");
+		const llm = getBundledModel("openai", "gpt-5-mini") as Model<"openai-responses">;
 
 		it(
 			"should complete basic text generation",
@@ -713,7 +714,7 @@ describe("Generate E2E Tests", () => {
 	});
 
 	describe.skipIf(!e2eApiKey("OPENAI_API_KEY"))("OpenAI Responses Provider (gpt-5-mini)", () => {
-		const model = getBundledModel("openai", "gpt-5-mini");
+		const model = getBundledModel("openai", "gpt-5-mini") as Model<"openai-responses">;
 
 		it(
 			"should complete basic text generation",
@@ -1509,7 +1510,7 @@ describe("Generate E2E Tests", () => {
 	});
 
 	// Ollama tests require PI_LOCAL_LLM=1 and ollama installed
-	const ollamaInstalled = !!Bun.env.PI_LOCAL_LLM && !!Bun.which("ollama");
+	const ollamaInstalled = !!Bun.env.PI_LOCAL_LLM && !!$which("ollama");
 
 	describe.skipIf(!ollamaInstalled)("Ollama Provider (gpt-oss-20b via OpenAI Completions)", () => {
 		let llm: Model<"openai-completions"> | undefined;

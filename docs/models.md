@@ -29,9 +29,19 @@ Legacy behavior still present:
 providers:
   <provider-id>:
     # provider-level config
+equivalence:
+  overrides:
+    <provider-id>/<model-id>: <canonical-model-id>
+  exclude:
+    - <provider-id>/<model-id>
 ```
 
 `provider-id` is the canonical provider key used across selection and auth lookup.
+
+`equivalence` is optional and configures canonical model grouping on top of concrete provider models:
+
+- `overrides` maps an exact concrete selector (`provider/modelId`) to an official upstream canonical id
+- `exclude` opts a concrete selector out of canonical grouping
 
 ## Provider-level fields
 
@@ -45,6 +55,7 @@ providers:
       X-Team: platform
     authHeader: true
     auth: apiKey
+    disableStrictTools: false  # set true for Anthropic-compatible endpoints that reject the strict field
     discovery:
       type: ollama
     modelOverrides:
@@ -91,8 +102,8 @@ providers:
 
 ### Allowed auth/discovery values
 
-- `auth`: `apiKey` (default) or `none`
-- `discovery.type`: `ollama`
+- `auth`: `apiKey` (default), `none`, or `oauth`; for `models.yml` custom models, `oauth` is accepted by schema but does not waive the `apiKey` requirement
+- `discovery.type`: `ollama`, `llama.cpp`, or `lm-studio`
 
 ## Validation rules (current)
 
@@ -109,6 +120,9 @@ Required:
 Must define at least one of:
 
 - `baseUrl`
+- `headers`
+- `compat`
+- `disableStrictTools`
 - `modelOverrides`
 - `discovery`
 
@@ -127,12 +141,78 @@ ModelRegistry pipeline (on refresh):
 
 1. Load built-in providers/models from `@oh-my-pi/pi-ai`.
 2. Load `models.yml` custom config.
-3. Apply provider overrides (`baseUrl`, `headers`) to built-in models.
+3. Apply provider overrides (`baseUrl`, `headers`, `disableStrictTools`) to built-in models.
 4. Apply `modelOverrides` (per provider + model id).
 5. Merge custom `models`:
    - same `provider + id` replaces existing
    - otherwise append
-6. Apply runtime-discovered models (currently Ollama and LM Studio), then re-apply model overrides.
+6. Load cached/runtime-discovered models (Ollama, llama.cpp, LM Studio, plus built-in provider managers), then re-apply model overrides.
+
+## Canonical model equivalence and coalescing
+
+The registry keeps every concrete provider model and then builds a canonical layer above them.
+
+Canonical ids are official upstream ids only, for example:
+
+- `claude-opus-4-6`
+- `claude-haiku-4-5`
+- `gpt-5.3-codex`
+
+### `models.yml` equivalence config
+
+Example:
+
+```yaml
+providers:
+  zenmux:
+    baseUrl: https://api.zenmux.example/v1
+    apiKey: ZENMUX_API_KEY
+    api: openai-codex-responses
+    models:
+      - id: codex
+        name: Zenmux Codex
+        reasoning: true
+        input: [text]
+        cost:
+          input: 0
+          output: 0
+          cacheRead: 0
+          cacheWrite: 0
+        contextWindow: 200000
+        maxTokens: 32768
+
+equivalence:
+  overrides:
+    zenmux/codex: gpt-5.3-codex
+    p-codex/codex: gpt-5.3-codex
+  exclude:
+    - demo/codex-preview
+```
+
+Build order for canonical grouping:
+
+1. exact user override from `equivalence.overrides`
+2. bundled official-id matches from built-in model metadata
+3. conservative heuristic normalization for gateway/provider variants
+4. fallback to the concrete model's own id
+
+Current heuristics are intentionally narrow:
+
+- embedded upstream prefixes can be stripped when present, for example `anthropic/...` or `openai/...`
+- dotted and dashed version variants can normalize only when they map to an existing official id, for example `4.6 -> 4-6`
+- ambiguous families or versions are not merged without a bundled match or explicit override
+
+### Canonical resolution behavior
+
+When multiple concrete variants share a canonical id, resolution uses:
+
+1. availability and auth
+2. `config.yml` `modelProviderOrder`
+3. existing registry/provider order if `modelProviderOrder` is unset
+
+Disabled or unauthenticated providers are skipped.
+
+Session state and transcripts continue to record the concrete provider/model that actually executed the turn.
 
 Provider defaults vs per-model overrides:
 
@@ -148,23 +228,22 @@ Provider defaults vs per-model overrides:
 If `ollama` is not explicitly configured, registry adds an implicit discoverable provider:
 
 - provider: `ollama`
-- api: `openai-completions`
+- api: `openai-responses`
 - base URL: `OLLAMA_BASE_URL` or `http://127.0.0.1:11434`
 - auth mode: keyless (`auth: none` behavior)
 
-Runtime discovery calls `GET /api/tags` on Ollama and synthesizes model entries with local defaults.
+Runtime discovery calls Ollama endpoints and normalizes discovered OpenAI-compatible models to `openai-responses`.
 
 ### Implicit llama.cpp discovery
 
 If `llama.cpp` is not explicitly configured, registry adds an implicit discoverable provider:
-Note: it's using the newer antropic messages api instead of the openai-competions.
 
 - provider: `llama.cpp`
 - api: `openai-responses`
 - base URL: `LLAMA_CPP_BASE_URL` or `http://127.0.0.1:8080`
 - auth mode: keyless (`auth: none` behavior)
 
-Runtime discovery calls `GET models` on llama.cpp and synthesizes model entries with local defaults.
+Runtime discovery calls llama.cpp model endpoints and synthesizes model entries with local defaults.
 
 ### Implicit LM Studio discovery
 
@@ -185,11 +264,11 @@ You can configure discovery yourself:
 providers:
   ollama:
     baseUrl: http://127.0.0.1:11434
-    api: openai-completions
+    api: openai-responses
     auth: none
     discovery:
       type: ollama
-      
+
   llama.cpp:
     baseUrl: http://127.0.0.1:8080
     api: openai-responses
@@ -244,12 +323,20 @@ So a model can exist in registry but not be selectable until auth is available.
 `model-resolver.ts` supports:
 
 - exact `provider/modelId`
+- exact canonical model id
 - exact model id (provider inferred)
 - fuzzy/substring matching
 - glob scope patterns in `--models` (e.g. `openai/*`, `*sonnet*`)
 - optional `:thinkingLevel` suffix (`off|minimal|low|medium|high|xhigh`)
 
 `--provider` is legacy; `--model` is preferred.
+
+Resolution precedence for exact selectors:
+
+1. exact `provider/modelId` bypasses coalescing
+2. exact canonical id resolves through the canonical index
+3. exact bare concrete id still works
+4. fuzzy and glob matching run after the exact paths
 
 ### Initial model selection priority
 
@@ -265,7 +352,7 @@ So a model can exist in registry but not be selectable until auth is available.
 
 Supported model roles:
 
-- `default`, `smol`, `slow`, `plan`, `commit`
+- `default`, `smol`, `slow`, `vision`, `plan`, `designer`, `commit`, `task`
 
 Role aliases like `pi/smol` expand through `settings.modelRoles`. Each role value can also append a thinking selector such as `:minimal`, `:low`, `:medium`, or `:high`.
 
@@ -275,8 +362,31 @@ Related settings:
 
 - `modelRoles` (record)
 - `enabledModels` (scoped pattern list)
+- `modelProviderOrder` (global canonical-provider precedence)
 - `providers.kimiApiFormat` (`openai` or `anthropic` request format)
 - `providers.openaiWebsockets` (`auto|off|on` websocket preference for OpenAI Codex transport)
+
+`modelRoles` may store either:
+
+- `provider/modelId` to pin a concrete provider variant
+- a canonical id such as `gpt-5.3-codex` to allow provider coalescing
+
+For `enabledModels` and CLI `--models`:
+
+- exact canonical ids expand to all concrete variants in that canonical group
+- explicit `provider/modelId` entries stay exact
+- globs and fuzzy matches still operate on concrete models
+
+## `/model` and `--list-models`
+
+Both surfaces keep provider-prefixed models visible and selectable.
+
+They now also expose canonical/coalesced models:
+
+- `/model` includes a canonical view alongside provider tabs
+- `--list-models` prints a canonical section plus the concrete provider rows
+
+Selecting a canonical entry stores the canonical selector. Selecting a provider row stores the explicit `provider/modelId`.
 
 ## Context promotion (model-level fallback chains)
 
@@ -344,6 +454,33 @@ The built-in model generator also assigns this automatically for `*-spark` model
 
 These are consumed by the OpenAI-completions transport logic and combined with URL-based auto-detection.
 
+### Strict tool schemas (`disableStrictTools`)
+
+Anthropic's API supports a `strict` field on tool definitions that forces the model to always follow the provided schema exactly. This is enabled by default for all `anthropic-messages` providers because it guarantees schema conformance in agentic systems.
+
+Third-party providers that front the Anthropic API (AWS Bedrock, Azure, self-hosted proxies) do not always implement this field and will reject requests that include it. Set `disableStrictTools: true` at the provider level to opt out:
+
+```yaml
+providers:
+  bedrock-anthropic:
+    baseUrl: https://bedrock-runtime.us-east-1.amazonaws.com/anthropic
+    apiKey: AWS_BEARER_TOKEN
+    api: anthropic-messages
+    disableStrictTools: true
+    models:
+      - id: claude-sonnet-4-20250514
+        name: Claude Sonnet 4 (Bedrock)
+        input: [text, image]
+        contextWindow: 200000
+        maxTokens: 16384
+        cost:
+          input: 3.00
+          output: 15.00
+          cacheRead: 0.30
+          cacheWrite: 3.75
+```
+
+`disableStrictTools` is a provider-level flag that applies to all models in the provider.
 ## Practical examples
 
 ### Local OpenAI-compatible endpoint (no auth)
@@ -368,6 +505,7 @@ providers:
     apiKey: ANTHROPIC_PROXY_API_KEY
     api: anthropic-messages
     authHeader: true
+    disableStrictTools: true  # if the proxy doesn't support strict tool schemas
     models:
       - id: claude-sonnet-4-20250514
         name: Claude Sonnet 4 (Proxy)
@@ -393,11 +531,7 @@ providers:
 
 ## Legacy consumer caveat
 
-Most model configuration now flows through `models.yml` via `ModelRegistry`.
-
-One notable legacy path remains: web-search Anthropic auth resolution still reads `~/.omp/agent/models.json` directly in `src/web/search/auth.ts`.
-
-If you rely on that specific path, keep JSON compatibility in mind until that module is migrated.
+Most model configuration now flows through `models.yml` via `ModelRegistry`. Explicit `.json` / `.jsonc` paths remain supported only when passed programmatically to `ModelRegistry`; the default user config is `~/.omp/agent/models.yml`.
 
 ## Failure mode
 

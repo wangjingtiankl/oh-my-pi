@@ -56,6 +56,13 @@ pi-*.html
 
 # Generated files
 packages/coding-agent/src/internal-urls/docs-index.generated.ts
-packages/typescript-edit-benchmark/runs/
+/runs/
+python/omp-rpc/src/omp_rpc.egg-info/
 
-all_models_results.json
+scripts/session-stats/Cargo.lock
+
+scripts/session-stats/edit-analysis.csv
+
+# parallel-agent worktrees
+.wt/
+CPU*.md

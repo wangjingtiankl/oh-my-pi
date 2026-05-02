@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { APP_NAME, getToolsDir, logger, ptree, TempDir } from "@oh-my-pi/pi-utils";
+import { $which, APP_NAME, getToolsDir, logger, ptree, TempDir } from "@oh-my-pi/pi-utils";
 
 const TOOLS_DIR = getToolsDir();
 const TOOL_DOWNLOAD_TIMEOUT_MS = 120_000;
@@ -74,14 +74,14 @@ const TOOLS: Record<string, ToolConfig> = {
 	},
 };
 
-// Python packages installed via uv/pip
-interface PythonToolConfig {
+// CLI packages installed via uv/pip
+interface PythonPackageToolConfig {
 	name: string;
 	package: string; // PyPI package name
 	binaryName: string; // CLI command name after install
 }
 
-const PYTHON_TOOLS: Record<string, PythonToolConfig> = {
+const PYTHON_TOOLS: Record<string, PythonPackageToolConfig> = {
 	trafilatura: {
 		name: "trafilatura",
 		package: "trafilatura",
@@ -93,10 +93,10 @@ export type ToolName = "sd" | "sg" | "yt-dlp" | "trafilatura";
 
 // Get the path to a tool (system-wide or in our tools dir)
 export function getToolPath(tool: ToolName): string | null {
-	// Check Python tools first
+	// Check uv/pip-installed CLI packages first
 	const pythonConfig = PYTHON_TOOLS[tool];
 	if (pythonConfig) {
-		return Bun.which(pythonConfig.binaryName);
+		return $which(pythonConfig.binaryName);
 	}
 
 	const config = TOOLS[tool];
@@ -109,7 +109,7 @@ export function getToolPath(tool: ToolName): string | null {
 	}
 
 	// Check system PATH
-	return Bun.which(config.binaryName);
+	return $which(config.binaryName);
 }
 
 // Fetch latest release version from GitHub
@@ -249,7 +249,7 @@ async function downloadTool(tool: ToolName, signal?: AbortSignal): Promise<strin
 // Install a Python package via uv (preferred) or pip
 async function installPythonPackage(pkg: string, signal?: AbortSignal): Promise<boolean> {
 	// Try uv first (faster, better isolation)
-	const uv = Bun.which("uv");
+	const uv = $which("uv");
 	if (uv) {
 		const result = await ptree.exec(["uv", "tool", "install", pkg], {
 			signal,
@@ -261,7 +261,7 @@ async function installPythonPackage(pkg: string, signal?: AbortSignal): Promise<
 	}
 
 	// Fall back to pip
-	const pip = Bun.which("pip3") || Bun.which("pip");
+	const pip = $which("pip3") || $which("pip");
 	if (pip) {
 		const result = await ptree.exec(["pip", "install", "--user", pkg], {
 			signal,
@@ -306,7 +306,7 @@ export async function ensureTool(tool: ToolName, silentOrOptions?: EnsureToolOpt
 		return undefined;
 	}
 
-	// Handle Python tools
+	// Handle uv/pip-installed CLI packages
 	const pythonConfig = PYTHON_TOOLS[tool];
 	if (pythonConfig) {
 		if (!silent) {
@@ -316,7 +316,7 @@ export async function ensureTool(tool: ToolName, silentOrOptions?: EnsureToolOpt
 		const success = await installPythonPackage(pythonConfig.package, signal);
 		if (success) {
 			// Re-check for the command after installation
-			const path = Bun.which(pythonConfig.binaryName);
+			const path = $which(pythonConfig.binaryName);
 			if (path) {
 				if (!silent) {
 					logger.debug(`${pythonConfig.name} installed successfully`);

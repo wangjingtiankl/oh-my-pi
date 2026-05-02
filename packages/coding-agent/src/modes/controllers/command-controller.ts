@@ -9,30 +9,32 @@ import {
 	type UsageLimit,
 	type UsageReport,
 } from "@oh-my-pi/pi-ai";
-import { copyToClipboard } from "@oh-my-pi/pi-natives";
 import { Loader, Markdown, padding, Spacer, Text, visibleWidth } from "@oh-my-pi/pi-tui";
 import { formatDuration, Snowflake, setProjectDir } from "@oh-my-pi/pi-utils";
 import { $ } from "bun";
 import { reset as resetCapabilities } from "../../capability";
 import { clearClaudePluginRootsCache } from "../../discovery/helpers";
+import { getGatewayStatus } from "../../eval/py/gateway-coordinator";
 import { loadCustomShare } from "../../export/custom-share";
 import type { CompactOptions } from "../../extensibility/extensions/types";
-import { getGatewayStatus } from "../../ipy/gateway-coordinator";
 import { buildMemoryToolDeveloperInstructions, clearMemoryData, enqueueMemoryConsolidation } from "../../memories";
 import { BashExecutionComponent } from "../../modes/components/bash-execution";
 import { BorderedLoader } from "../../modes/components/bordered-loader";
 import { DynamicBorder } from "../../modes/components/dynamic-border";
-import { PythonExecutionComponent } from "../../modes/components/python-execution";
+import { EvalExecutionComponent } from "../../modes/components/eval-execution";
 import { getMarkdownTheme, getSymbolTheme, theme } from "../../modes/theme/theme";
 import type { InteractiveModeContext } from "../../modes/types";
+import { computeContextBreakdown, renderContextUsage } from "../../modes/utils/context-usage";
 import { buildHotkeysMarkdown } from "../../modes/utils/hotkeys-markdown";
 import { buildToolsMarkdown } from "../../modes/utils/tools-markdown";
 import type { AsyncJobSnapshotItem } from "../../session/agent-session";
 import type { AuthStorage } from "../../session/auth-storage";
+import type { NewSessionOptions } from "../../session/session-manager";
 import { outputMeta } from "../../tools/output-meta";
 import { resolveToCwd, stripOuterDoubleQuotes } from "../../tools/path-utils";
 import { replaceTabs } from "../../tools/render-utils";
 import { getChangelogPath, parseChangelog } from "../../utils/changelog";
+import { copyToClipboard } from "../../utils/clipboard";
 import { openPath } from "../../utils/open";
 import { setSessionTerminalTitle } from "../../utils/title-generator";
 
@@ -283,9 +285,26 @@ export class CommandController {
 		this.#doCopy(combined, `Copied ${matches.length} code block${matches.length > 1 ? "s" : ""} to clipboard`);
 	}
 
+	#extractEvalCode(args: unknown): string | undefined {
+		if (!args || typeof args !== "object") return undefined;
+		const cells = (args as { cells?: unknown }).cells;
+		if (!Array.isArray(cells)) return undefined;
+
+		const codeBlocks: string[] = [];
+		for (const cell of cells) {
+			if (!cell || typeof cell !== "object") continue;
+			const code = (cell as { code?: unknown }).code;
+			if (typeof code === "string" && code.length > 0) {
+				codeBlocks.push(code);
+			}
+		}
+
+		return codeBlocks.length > 0 ? codeBlocks.join("\n\n") : undefined;
+	}
+
 	#copyLastCommand() {
 		const messages = this.ctx.session.messages;
-		// Walk backwards to find the last bash/python tool call
+		// Walk backwards to find the last bash/eval tool call
 		for (let i = messages.length - 1; i >= 0; i--) {
 			const msg = messages[i];
 			if (msg.role !== "assistant") continue;
@@ -296,13 +315,16 @@ export class CommandController {
 					this.#doCopy(tc.arguments.command, "Copied last bash command to clipboard");
 					return;
 				}
-				if (tc.name === "python" && typeof tc.arguments.code === "string") {
-					this.#doCopy(tc.arguments.code, "Copied last python code to clipboard");
-					return;
+				if (tc.name === "eval") {
+					const code = this.#extractEvalCode(tc.arguments);
+					if (code) {
+						this.#doCopy(code, "Copied last eval code to clipboard");
+						return;
+					}
 				}
 			}
 		}
-		this.ctx.showWarning("No bash or python command found in the conversation.");
+		this.ctx.showWarning("No bash or eval command found in the conversation.");
 	}
 
 	#doCopy(content: string, label: string) {
@@ -396,7 +418,8 @@ export class CommandController {
 		if (this.ctx.lspServers && this.ctx.lspServers.length > 0) {
 			info += `\n${theme.bold("LSP Servers")}\n`;
 			for (const server of this.ctx.lspServers) {
-				const statusColor = server.status === "ready" ? "success" : "error";
+				const statusColor =
+					server.status === "ready" ? "success" : server.status === "connecting" ? "warning" : "error";
 				const statusText =
 					server.status === "error" && server.error ? `${server.status}: ${server.error}` : server.status;
 				info += `${theme.fg("dim", `${server.name}:`)} ${theme.fg(statusColor, statusText)} ${theme.fg("dim", `(${server.fileTypes.join(", ")})`)}\n`;
@@ -527,6 +550,22 @@ export class CommandController {
 		showMarkdownPanel(this.ctx, "Available Tools", tools);
 	}
 
+	handleContextCommand(): void {
+		const breakdown = computeContextBreakdown(this.ctx.session);
+		if (breakdown.contextWindow <= 0) {
+			this.ctx.showWarning("Context usage is unavailable: no model is selected for this session.");
+			return;
+		}
+		const output = renderContextUsage(breakdown, theme);
+		this.ctx.chatContainer.addChild(new Spacer(1));
+		this.ctx.chatContainer.addChild(new DynamicBorder());
+		this.ctx.chatContainer.addChild(new Text(theme.bold(theme.fg("accent", "Context Usage")), 1, 0));
+		this.ctx.chatContainer.addChild(new Spacer(1));
+		this.ctx.chatContainer.addChild(new Text(output, 1, 0));
+		this.ctx.chatContainer.addChild(new DynamicBorder());
+		this.ctx.ui.requestRender();
+	}
+
 	async handleMemoryCommand(text: string): Promise<void> {
 		const argumentText = text.slice(7).trim();
 		const action = argumentText.split(/\s+/, 1)[0]?.toLowerCase() || "view";
@@ -572,7 +611,7 @@ export class CommandController {
 		this.ctx.showError("Usage: /memory <view|clear|reset|enqueue|rebuild>");
 	}
 
-	async handleClearCommand(): Promise<void> {
+	async #runNewSessionFlow(options?: NewSessionOptions, label: string = "New session started"): Promise<void> {
 		if (this.ctx.loadingAnimation) {
 			this.ctx.loadingAnimation.stop();
 			this.ctx.loadingAnimation = undefined;
@@ -585,13 +624,14 @@ export class CommandController {
 				await Bun.sleep(10);
 			}
 		}
-		await this.ctx.session.newSession();
+		if (!(await this.ctx.session.newSession(options))) return;
 		this.ctx.resetObserverRegistry();
 		setSessionTerminalTitle(this.ctx.sessionManager.getSessionName(), this.ctx.sessionManager.getCwd());
 
 		this.ctx.statusLine.invalidate();
 		this.ctx.statusLine.setSessionStartTime(Date.now());
 		this.ctx.updateEditorTopBorder();
+		this.ctx.updateEditorBorderColor();
 		this.ctx.ui.requestRender();
 
 		this.ctx.chatContainer.clear();
@@ -602,11 +642,21 @@ export class CommandController {
 		this.ctx.pendingTools.clear();
 
 		this.ctx.chatContainer.addChild(new Spacer(1));
-		this.ctx.chatContainer.addChild(
-			new Text(`${theme.fg("accent", `${theme.status.success} New session started`)}`, 1, 1),
-		);
+		this.ctx.chatContainer.addChild(new Text(`${theme.fg("accent", `${theme.status.success} ${label}`)}`, 1, 1));
 		await this.ctx.reloadTodos();
 		this.ctx.ui.requestRender();
+	}
+
+	async handleClearCommand(): Promise<void> {
+		await this.#runNewSessionFlow();
+	}
+
+	async handleDropCommand(): Promise<void> {
+		if (!this.ctx.sessionManager.getSessionFile()) {
+			this.ctx.showError("Nothing to drop (in-memory session)");
+			return;
+		}
+		await this.#runNewSessionFlow({ drop: true }, "Session dropped");
 	}
 
 	async handleForkCommand(): Promise<void> {
@@ -685,6 +735,23 @@ export class CommandController {
 		}
 	}
 
+	async handleRenameCommand(title: string): Promise<void> {
+		try {
+			const stored = await this.ctx.sessionManager.setSessionName(title, "user");
+			if (!stored) {
+				this.ctx.showError("Session name cannot be empty.");
+				return;
+			}
+			const name = this.ctx.sessionManager.getSessionName()!;
+			setSessionTerminalTitle(name, this.ctx.sessionManager.getCwd());
+			this.ctx.statusLine.invalidate();
+			this.ctx.updateEditorBorderColor();
+			this.ctx.showStatus(`Session renamed to "${name}".`);
+		} catch (err) {
+			this.ctx.showError(`Rename failed: ${err instanceof Error ? err.message : String(err)}`);
+		}
+	}
+
 	async handleBashCommand(command: string, excludeFromContext = false): Promise<void> {
 		const isDeferred = this.ctx.session.isStreaming;
 		this.ctx.bashComponent = new BashExecutionComponent(command, this.ctx.ui, excludeFromContext);
@@ -728,7 +795,7 @@ export class CommandController {
 
 	async handlePythonCommand(code: string, excludeFromContext = false): Promise<void> {
 		const isDeferred = this.ctx.session.isStreaming;
-		this.ctx.pythonComponent = new PythonExecutionComponent(code, this.ctx.ui, excludeFromContext);
+		this.ctx.pythonComponent = new EvalExecutionComponent(code, this.ctx.ui, excludeFromContext);
 
 		if (isDeferred) {
 			this.ctx.pendingMessagesContainer.addChild(this.ctx.pythonComponent);
@@ -868,6 +935,7 @@ export class CommandController {
 
 			this.ctx.statusLine.invalidate();
 			this.ctx.updateEditorTopBorder();
+			this.ctx.updateEditorBorderColor();
 			await this.ctx.reloadTodos();
 
 			this.ctx.chatContainer.addChild(new Spacer(1));
@@ -997,6 +1065,14 @@ function formatAccountLabel(limit: UsageLimit, report: UsageReport, index: numbe
 	const email = (report.metadata?.email as string | undefined) ?? limit.scope.accountId;
 	if (email) return email;
 	const accountId = (report.metadata?.accountId as string | undefined) ?? limit.scope.accountId;
+	if (accountId) return accountId;
+	return `account ${index + 1}`;
+}
+
+function formatUnlimitedReportLabel(report: UsageReport, index: number): string {
+	const email = report.metadata?.email as string | undefined;
+	if (email) return email;
+	const accountId = report.metadata?.accountId as string | undefined;
 	if (accountId) return accountId;
 	return `account ${index + 1}`;
 }
@@ -1187,6 +1263,16 @@ function renderUsageReports(reports: UsageReport[], uiTheme: typeof theme, nowMs
 			}
 		}
 
+		// Render accounts with no rate limits (e.g. business/enterprise plans).
+		const unlimitedReports = providerReports.filter(report => report.limits.length === 0);
+		for (const report of unlimitedReports) {
+			const label = formatUnlimitedReportLabel(report, 0);
+			const tier = report.metadata?.planType as string | undefined;
+			const tierSuffix = tier ? ` ${uiTheme.fg("dim", `(${tier})`)}` : "";
+			lines.push(
+				`${uiTheme.fg("success", uiTheme.status.success)} ${label}${tierSuffix} ${uiTheme.fg("dim", "-- no limits")}`,
+			);
+		}
 		// No per-provider footer; global header shows last check.
 	}
 

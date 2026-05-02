@@ -1,14 +1,14 @@
 //! Command execution
 
-use std::{borrow::Cow, ffi::OsStr, fmt::Display, io, sync::Arc};
+use std::{borrow::Cow, ffi::OsStr, fmt::Display, io, io::Write, sync::Arc};
 
 use brush_parser::ast;
 use itertools::Itertools;
-use sys::commands::{CommandExt, CommandFdInjectionExt, CommandFgControlExt};
+use sys::commands::{CommandExt, CommandFdInjectionExt, CommandFgControlExt, CommandSessionExt};
 
 use crate::{
-	ErrorKind, ExecutionControlFlow, ExecutionParameters, ExecutionResult, Shell, ShellFd, builtins,
-	env, error, escape,
+	ErrorKind, ExecutionControlFlow, ExecutionParameters, ExecutionResult, ExternalCommandInfo,
+	ExternalCommandOutputMarkers, Shell, ShellFd, builtins, env, error, escape,
 	interp::{self, Execute, ProcessGroupPolicy},
 	openfiles::{self, OpenFiles},
 	pathsearch, processes,
@@ -296,7 +296,7 @@ async fn invoke_debug_trap_handler_if_registered(
 /// * `path_dirs` - If provided, these directories will be searched for external
 ///   commands; if not provided, the default search logic will be used.
 pub async fn execute(
-	cmd_context: ExecutionContext<'_>,
+	mut cmd_context: ExecutionContext<'_>,
 	process_group_id: &mut Option<i32>,
 	args: Vec<CommandArg>,
 	use_functions: bool,
@@ -325,6 +325,7 @@ pub async fn execute(
 			.funcs()
 			.get(cmd_context.command_name.as_str())
 		{
+			cmd_context.params.disable_command_output_marking();
 			// Strip the function name off args.
 			return invoke_shell_function(func_reg.definition.clone(), cmd_context, &args[1..]).await;
 		}
@@ -391,6 +392,8 @@ pub(crate) fn execute_external_command(
 
 	// Figure out if we should be setting up a new process group.
 	let new_pg = context.should_cmd_lead_own_process_group();
+	let mut marker_output =
+		prepare_output_markers(&context, executable_path, cmd_args.as_slice());
 
 	// Compose the std::process::Command that encapsulates what we want to launch.
 	#[allow(unused_mut, reason = "only mutated on unix platforms")]
@@ -413,11 +416,12 @@ pub(crate) fn execute_external_command(
 		}
 	}
 
-	// If we're to lead our own process group and stdin is a terminal,
-	// then we need to arrange for the new process to move itself
-	// to the foreground.
-	if new_pg && child_stdin_is_terminal {
-		cmd.take_foreground();
+	// See `child_session_action` for the decision rationale and call-out about
+	// pipeline groups.
+	match child_session_action(new_pg, child_stdin_is_terminal, process_group_id.is_some()) {
+		ChildSessionAction::DetachSession => cmd.detach_session(),
+		ChildSessionAction::TakeForeground => cmd.take_foreground(),
+		ChildSessionAction::None => {}
 	}
 
 	// When tracing is enabled, report.
@@ -443,9 +447,21 @@ pub(crate) fn execute_external_command(
 				tracing::warn!("could not retrieve pid for child process");
 			}
 
-			Ok(ExecutionSpawnResult::StartedProcess(processes::ChildProcess::new(pid, child)))
+			let mut child_process = processes::ChildProcess::new(pid, child);
+			if let Some((output, markers)) = marker_output.take() {
+				child_process.set_completion_marker(
+					output,
+					markers.end_marker_prefix,
+					markers.end_marker_suffix,
+				);
+			}
+			Ok(ExecutionSpawnResult::StartedProcess(child_process))
 		},
 		Err(spawn_err) => {
+			if let Some((mut output, markers)) = marker_output.take() {
+				let _ = write_completion_marker(&mut output, &markers, 127);
+			}
+
 			if context.shell.options.interactive {
 				sys::terminal::move_self_to_foreground()?;
 			}
@@ -464,6 +480,36 @@ pub(crate) fn execute_external_command(
 			}
 		},
 	}
+}
+
+fn prepare_output_markers(
+	context: &ExecutionContext<'_>,
+	executable_path: &str,
+	args: &[&String],
+) -> Option<(openfiles::OpenFile, ExternalCommandOutputMarkers)> {
+	let marker = context.params.command_output_marker()?;
+	let markers = marker.markers_for_external_command(ExternalCommandInfo {
+		command_name:    context.command_name.as_str(),
+		executable_path,
+		args:            args.iter().map(|arg| arg.as_str()).collect(),
+	})?;
+	let mut output = context.params.try_stdout(context.shell)?;
+	if output.write_all(markers.start_marker.as_bytes()).is_err() {
+		return None;
+	}
+	if output.flush().is_err() {
+		return None;
+	}
+	Some((output, markers))
+}
+
+fn write_completion_marker(
+	output: &mut openfiles::OpenFile,
+	markers: &ExternalCommandOutputMarkers,
+	exit_code: i32,
+) -> io::Result<()> {
+	write!(output, "{}{}{}", markers.end_marker_prefix, exit_code, markers.end_marker_suffix)?;
+	output.flush()
 }
 
 async fn execute_builtin_command(
@@ -543,6 +589,7 @@ pub(crate) async fn invoke_command_in_subshell_and_get_output(
 	// Get our own set of parameters we can customize and use.
 	let mut params = params.clone();
 	params.process_group_policy = ProcessGroupPolicy::SameProcessGroup;
+	params.disable_command_output_marking();
 
 	// Set up pipe so we can read the output.
 	let (reader, writer) = io::pipe()?;
@@ -708,4 +755,53 @@ fn try_unwrap_bare_input_redir_program(program: &ast::Program) -> Option<&ast::I
 		) if fd.is_none_or(|fd| fd == openfiles::OpenFiles::STDIN_FD) => Some(redir),
 		_ => None,
 	}
+}
+
+
+/// What to do with the child's controlling-tty/session ownership immediately
+/// before spawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildSessionAction {
+	/// Call `setsid()` (via `cmd.detach_session()`) so the child cannot stop
+	/// the parent through SIGTTIN/SIGTTOU on the inherited tty.
+	DetachSession,
+	/// Move the child to the foreground of its tty so it participates in
+	/// interactive job control.
+	TakeForeground,
+	/// Leave session/foreground state alone.
+	None,
+}
+
+/// Decide whether to detach the child's session, foreground it, or do nothing.
+///
+/// The pre-fix code only detached when `new_pg` was set, which is gated on
+/// brush's `interactive` flag. When brush is embedded in a non-interactive host
+/// (e.g. `pi-natives` inside OMP), `new_pg` is false, the child inherited the
+/// host's controlling tty, and any `/dev/tty` open or `tcsetpgrp` call from the
+/// child could SIGTTIN/SIGTTOU and stop the host.
+///
+/// `detach_session()` is also unsafe to call when joining an established
+/// pipeline group (`!new_pg && in_pipeline_group`): `setsid()` would either
+/// fail with EPERM or move the child into a fresh session, breaking the
+/// pipeline's shared process group and its job-control signal propagation.
+/// Pipeline stages therefore keep their pre-fix behavior (no detach).
+///
+/// `take_foreground()` is preserved exactly: still gated on
+/// `new_pg && child_stdin_is_terminal`.
+pub fn child_session_action(
+	new_pg: bool,
+	child_stdin_is_terminal: bool,
+	in_pipeline_group: bool,
+) -> ChildSessionAction {
+	if new_pg && child_stdin_is_terminal {
+		return ChildSessionAction::TakeForeground;
+	}
+	if child_stdin_is_terminal {
+		return ChildSessionAction::None;
+	}
+	let joining_pipeline_group = !new_pg && in_pipeline_group;
+	if joining_pipeline_group {
+		return ChildSessionAction::None;
+	}
+	ChildSessionAction::DetachSession
 }

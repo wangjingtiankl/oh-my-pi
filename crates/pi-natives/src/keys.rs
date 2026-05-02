@@ -72,6 +72,27 @@ const MOD_ALT: u32 = 2;
 const MOD_CTRL: u32 = 4;
 const MOD_NUM_LOCK: u32 = 128;
 
+/// Event types from Kitty keyboard protocol (flag 2).
+#[napi]
+pub enum KeyEventType {
+	/// Key press event.
+	Press   = 1,
+	/// Key repeat event.
+	Repeat  = 2,
+	/// Key release event.
+	Release = 3,
+}
+
+#[inline]
+fn optional_kitty_event_type(event: Option<u32>) -> Option<KeyEventType> {
+	event.and_then(|ev| match ev {
+		1 => Some(KeyEventType::Press),
+		2 => Some(KeyEventType::Repeat),
+		3 => Some(KeyEventType::Release),
+		_ => None,
+	})
+}
+
 #[inline]
 const fn map_keypad_nav(codepoint: i32) -> Option<i32> {
 	match codepoint {
@@ -142,7 +163,7 @@ pub struct ParsedKittyResult {
 	/// Modifier bitmask (shift/alt/ctrl), excluding lock bits.
 	pub modifier:        u32,
 	/// Optional event type (1 = press, 2 = repeat, 3 = release).
-	pub event_type:      Option<u32>,
+	pub event_type:      Option<KeyEventType>,
 }
 
 /// Perfect hash map for legacy sequences - O(1) lookup
@@ -234,6 +255,35 @@ static CTRL_ALT_LETTERS: [&str; 26] = [
 	"ctrl+alt+z",
 ];
 
+static ALT_SHIFT_LETTERS: [&str; 26] = [
+	"alt+shift+a",
+	"alt+shift+b",
+	"alt+shift+c",
+	"alt+shift+d",
+	"alt+shift+e",
+	"alt+shift+f",
+	"alt+shift+g",
+	"alt+shift+h",
+	"alt+shift+i",
+	"alt+shift+j",
+	"alt+shift+k",
+	"alt+shift+l",
+	"alt+shift+m",
+	"alt+shift+n",
+	"alt+shift+o",
+	"alt+shift+p",
+	"alt+shift+q",
+	"alt+shift+r",
+	"alt+shift+s",
+	"alt+shift+t",
+	"alt+shift+u",
+	"alt+shift+v",
+	"alt+shift+w",
+	"alt+shift+x",
+	"alt+shift+y",
+	"alt+shift+z",
+];
+
 static LETTERS: [&str; 26] = [
 	"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s",
 	"t", "u", "v", "w", "x", "y", "z",
@@ -247,13 +297,13 @@ static LETTERS: [&str; 26] = [
 ///
 /// Returns true when the parsed sequence matches the expected codepoint (or
 /// base layout key) and modifier bits.
-#[napi(js_name = "matchesKittySequence")]
+#[napi]
 pub fn matches_kitty_sequence(
 	data: String,
 	expected_codepoint: i32,
 	expected_modifier: u32,
 ) -> bool {
-	let Some(parsed) = parse_kitty_sequence(data.as_bytes()) else {
+	let Some(parsed) = parse_kitty_sequence_bytes(data.as_bytes()) else {
 		return false;
 	};
 
@@ -329,7 +379,7 @@ const fn is_symbol_key(cp: i32) -> bool {
 /// Parse terminal input and return a normalized key identifier.
 ///
 /// Returns a key id like "escape" or "ctrl+c", or None if unrecognized.
-#[napi(js_name = "parseKey")]
+#[napi]
 pub fn parse_key(data: String, kitty_protocol_active: bool) -> Option<String> {
 	parse_key_inner(data.as_bytes(), kitty_protocol_active).map(|s| s.into_owned())
 }
@@ -337,7 +387,7 @@ pub fn parse_key(data: String, kitty_protocol_active: bool) -> Option<String> {
 /// Check if input matches a legacy escape sequence for the given key name.
 ///
 /// Returns true only when the byte sequence maps to the exact key identifier.
-#[napi(js_name = "matchesLegacySequence")]
+#[napi]
 pub fn matches_legacy_sequence(data: String, key_name: String) -> bool {
 	LEGACY_SEQUENCES
 		.get(data.as_bytes())
@@ -347,7 +397,7 @@ pub fn matches_legacy_sequence(data: String, key_name: String) -> bool {
 /// Match input data against a key identifier string.
 ///
 /// Returns true when the bytes represent the specified key with modifiers.
-#[napi(js_name = "matchesKey")]
+#[napi]
 pub fn matches_key(data: String, key_id: String, kitty_protocol_active: bool) -> bool {
 	matches_key_inner(data.as_bytes(), &key_id, kitty_protocol_active)
 }
@@ -355,14 +405,14 @@ pub fn matches_key(data: String, key_id: String, kitty_protocol_active: bool) ->
 /// Parse a Kitty keyboard protocol sequence.
 ///
 /// Returns a structured parse result when the input is a valid Kitty sequence.
-#[napi(js_name = "parseKittySequence")]
-pub fn parse_kitty_sequence_napi(data: String) -> Option<ParsedKittyResult> {
-	parse_kitty_sequence(data.as_bytes()).map(|p| ParsedKittyResult {
+#[napi]
+pub fn parse_kitty_sequence(data: String) -> Option<ParsedKittyResult> {
+	parse_kitty_sequence_bytes(data.as_bytes()).map(|p| ParsedKittyResult {
 		codepoint:       p.codepoint,
 		shifted_key:     p.shifted_key,
 		base_layout_key: p.base_layout_key,
 		modifier:        p.modifier,
-		event_type:      p.event_type,
+		event_type:      optional_kitty_event_type(p.event_type),
 	})
 }
 
@@ -491,7 +541,7 @@ fn matches_key_inner(bytes: &[u8], key_id: &str, kitty_protocol_active: bool) ->
 	};
 
 	// Parse Kitty once (avoid repeated parsing in branches).
-	let kitty_parsed = parse_kitty_sequence(bytes);
+	let kitty_parsed = parse_kitty_sequence_bytes(bytes);
 	let kitty_matches = |codepoint: i32, m: u32| -> bool {
 		let Some(p) = kitty_parsed.as_ref() else {
 			return false;
@@ -801,6 +851,11 @@ fn matches_key_inner(bytes: &[u8], key_id: &str, kitty_protocol_active: bool) ->
 			return bytes.len() == 2 && bytes[0] == 0x1b && bytes[1] == ch;
 		}
 
+		// alt+shift+letter in legacy mode (ESC + UPPERCASE letter)
+		if modifier == (MOD_ALT | MOD_SHIFT) && !kitty_protocol_active && is_letter {
+			return bytes.len() == 2 && bytes[0] == 0x1b && bytes[1] == ch.to_ascii_uppercase();
+		}
+
 		// ctrl+key
 		if modifier == MOD_CTRL {
 			if is_letter {
@@ -930,7 +985,7 @@ fn parse_key_inner(bytes: &[u8], kitty_protocol_active: bool) -> Option<Cow<'sta
 
 	// Try Kitty protocol sequences (including enhanced CSI-u with optional text
 	// field)
-	if let Some(parsed) = parse_kitty_sequence(bytes) {
+	if let Some(parsed) = parse_kitty_sequence_bytes(bytes) {
 		if parsed.event_type == Some(3) {
 			return None;
 		}
@@ -991,6 +1046,7 @@ fn parse_esc_pair(code: u8, kitty_protocol_active: bool) -> Option<Cow<'static, 
 			b'F' => return Some(Cow::Borrowed("alt+right")),
 			1..=26 => return Some(Cow::Borrowed(CTRL_ALT_LETTERS[(code - 1) as usize])),
 			b'a'..=b'z' => return Some(Cow::Borrowed(ALT_LETTERS[(code - b'a') as usize])),
+			b'A'..=b'Z' => return Some(Cow::Borrowed(ALT_SHIFT_LETTERS[(code - b'A') as usize])),
 			_ => {},
 		}
 	}
@@ -1002,7 +1058,7 @@ fn parse_esc_pair(code: u8, kitty_protocol_active: bool) -> Option<Cow<'static, 
 // Kitty Protocol Parsing
 // =============================================================================
 
-fn parse_kitty_sequence(bytes: &[u8]) -> Option<ParsedKittySequence> {
+fn parse_kitty_sequence_bytes(bytes: &[u8]) -> Option<ParsedKittySequence> {
 	if bytes.len() < 4 || bytes[0] != 0x1b || bytes[1] != b'[' {
 		return None;
 	}

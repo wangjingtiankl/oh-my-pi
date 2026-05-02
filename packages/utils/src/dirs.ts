@@ -261,6 +261,11 @@ export function getRemoteDir(): string {
 	return dirs.rootSubdir("remote", "data");
 }
 
+/** Get the PR worktrees directory (~/.omp/wt). */
+export function getWorktreesDir(): string {
+	return dirs.rootSubdir("wt", "data");
+}
+
 /** Get the SSH control socket directory (~/.omp/ssh-control). */
 export function getSshControlDir(): string {
 	return dirs.rootSubdir("ssh-control", "state");
@@ -306,6 +311,26 @@ export function getStatsDbPath(): string {
 	return dirs.rootSubdir("stats.db", "data");
 }
 
+/** Get the autoresearch state directory (~/.omp/autoresearch). */
+export function getAutoresearchDir(): string {
+	return dirs.rootSubdir("autoresearch", "state");
+}
+
+/** Get the per-project autoresearch state directory (~/.omp/autoresearch/<encoded-project>). */
+export function getAutoresearchProjectDir(encodedProject: string): string {
+	return path.join(getAutoresearchDir(), encodedProject);
+}
+
+/** Get the per-project autoresearch SQLite database path (~/.omp/autoresearch/<encoded-project>.db). */
+export function getAutoresearchDbPath(encodedProject: string): string {
+	return path.join(getAutoresearchDir(), `${encodedProject}.db`);
+}
+
+/** Get the per-run artifact directory (~/.omp/autoresearch/<encoded-project>/runs/<runId>). */
+export function getAutoresearchRunDir(encodedProject: string, runId: number): string {
+	return path.join(getAutoresearchProjectDir(encodedProject), "runs", String(runId).padStart(4, "0"));
+}
+
 // =============================================================================
 // Agent subdirectories (~/.omp/agent/*)
 // =============================================================================
@@ -323,11 +348,6 @@ export function getHistoryDbPath(agentDir?: string): string {
 /** Get the path to models.db (model cache database). */
 export function getModelDbPath(agentDir?: string): string {
 	return dirs.agentSubdir(agentDir, "models.db", "data");
-}
-
-/** Get the directory path for the shared search DB state (~/.omp/agent/search-db). */
-export function getSearchDbDir(agentDir?: string): string {
-	return dirs.agentSubdir(agentDir, "search-db", "data");
 }
 
 /** Get the sessions directory (~/.omp/agent/sessions). */

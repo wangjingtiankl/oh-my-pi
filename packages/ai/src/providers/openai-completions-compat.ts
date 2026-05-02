@@ -1,18 +1,21 @@
 import type { Model, OpenAICompat } from "../types";
 
 type OpenAIReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh";
+type ResolvedToolStrictMode = NonNullable<OpenAICompat["toolStrictMode"]> | "mixed";
 
 export type ResolvedOpenAICompat = Required<
-	Omit<OpenAICompat, "openRouterRouting" | "vercelGatewayRouting" | "extraBody">
+	Omit<OpenAICompat, "openRouterRouting" | "vercelGatewayRouting" | "extraBody" | "toolStrictMode">
 > & {
 	openRouterRouting?: OpenAICompat["openRouterRouting"];
 	vercelGatewayRouting?: OpenAICompat["vercelGatewayRouting"];
 	extraBody?: OpenAICompat["extraBody"];
+	toolStrictMode: ResolvedToolStrictMode;
 };
 
 function detectStrictModeSupport(provider: string, baseUrl: string): boolean {
 	if (
 		provider === "openai" ||
+		provider === "openrouter" ||
 		provider === "cerebras" ||
 		provider === "together" ||
 		provider === "github-copilot" ||
@@ -28,6 +31,7 @@ function detectStrictModeSupport(provider: string, baseUrl: string): boolean {
 		normalizedBaseUrl.includes("models.inference.ai.azure.com") ||
 		normalizedBaseUrl.includes("api.cerebras.ai") ||
 		normalizedBaseUrl.includes("api.together.xyz") ||
+		normalizedBaseUrl.includes("openrouter.ai") ||
 		normalizedBaseUrl.includes("api.deepseek.com") ||
 		normalizedBaseUrl.includes("deepseek.com")
 	);
@@ -47,9 +51,28 @@ export function detectOpenAICompat(model: Model<"openai-completions">, resolvedB
 
 	const isCerebras = provider === "cerebras" || baseUrl.includes("cerebras.ai");
 	const isZai = provider === "zai" || baseUrl.includes("api.z.ai");
-	const isKimiModel = model.id.includes("moonshotai/kimi");
+	const isKilo = provider === "kilo" || baseUrl.includes("api.kilo.ai");
+	const isKimiModel = model.id.includes("moonshotai/kimi") || /^kimi[-.]/i.test(model.id);
+	const isAnthropicModel =
+		provider === "anthropic" ||
+		baseUrl.includes("api.anthropic.com") ||
+		/(^|\/)claude[-.]/i.test(model.id) ||
+		/(^|\/)anthropic\//i.test(model.id);
 	const isAlibaba = provider === "alibaba-coding-plan" || baseUrl.includes("dashscope");
 	const isQwen = model.id.toLowerCase().includes("qwen");
+	// DeepSeek V4 (and other reasoning-capable DeepSeek models) reject follow-up requests in
+	// thinking mode unless prior assistant tool-call turns include `reasoning_content`. The
+	// upstream model is reachable through many OpenAI-compat hosts (api.deepseek.com, Deepinfra,
+	// Kilo, NVIDIA NIM, Zenmux, OpenRouter, …), so we match by model id/name as well as by
+	// provider/baseUrl. The flag is gated by `model.reasoning` because the invariant only
+	// applies when thinking mode is actually engaged.
+	const lowerId = model.id.toLowerCase();
+	const lowerName = (model.name ?? "").toLowerCase();
+	const isDeepseekFamily =
+		provider === "deepseek" ||
+		baseUrl.includes("deepseek.com") ||
+		lowerId.includes("deepseek") ||
+		lowerName.includes("deepseek");
 
 	const isNonStandard =
 		isCerebras ||
@@ -59,14 +82,20 @@ export function detectOpenAICompat(model: Model<"openai-completions">, resolvedB
 		baseUrl.includes("mistral.ai") ||
 		baseUrl.includes("chutes.ai") ||
 		baseUrl.includes("deepseek.com") ||
+		baseUrl.includes("fireworks.ai") ||
 		isAlibaba ||
 		isZai ||
+		isKilo ||
 		isQwen ||
 		provider === "opencode-zen" ||
 		provider === "opencode-go" ||
 		baseUrl.includes("opencode.ai");
 
-	const useMaxTokens = provider === "mistral" || baseUrl.includes("mistral.ai") || baseUrl.includes("chutes.ai");
+	const useMaxTokens =
+		provider === "mistral" ||
+		baseUrl.includes("mistral.ai") ||
+		baseUrl.includes("chutes.ai") ||
+		baseUrl.includes("fireworks.ai");
 	const isGrok = provider === "xai" || baseUrl.includes("api.x.ai");
 	const isMistral = provider === "mistral" || baseUrl.includes("mistral.ai");
 
@@ -79,7 +108,9 @@ export function detectOpenAICompat(model: Model<"openai-completions">, resolvedB
 					high: "default",
 					xhigh: "default",
 				} satisfies Partial<Record<OpenAIReasoningEffort, string>>)
-			: {};
+			: isDeepseekFamily && model.reasoning
+				? { xhigh: "max" }
+				: {};
 
 	return {
 		supportsStore: !isNonStandard,
@@ -87,6 +118,7 @@ export function detectOpenAICompat(model: Model<"openai-completions">, resolvedB
 		supportsReasoningEffort: !isGrok && !isZai,
 		reasoningEffortMap,
 		supportsUsageInStreaming: !isCerebras,
+		disableReasoningOnForcedToolChoice: isKimiModel || isAnthropicModel,
 		supportsToolChoice: true,
 		maxTokensField: useMaxTokens ? "max_tokens" : "max_completion_tokens",
 		requiresToolResultName: isMistral,
@@ -101,12 +133,25 @@ export function detectOpenAICompat(model: Model<"openai-completions">, resolvedB
 					? "qwen"
 					: "openai",
 		reasoningContentField: "reasoning_content",
-		requiresReasoningContentForToolCalls: isKimiModel,
+		// Backends that 400 follow-up requests when prior assistant tool-call turns lack `reasoning_content`:
+		//   - Kimi: documented invariant on its native API and via OpenCode-Go.
+		//   - Any reasoning-capable model reached through OpenRouter: DeepSeek V4 Pro and similar enforce
+		//     this server-side whenever the request is in thinking mode. We can't translate Anthropic's
+		//     redacted/encrypted reasoning into DeepSeek's plaintext form, so cross-provider continuations
+		//     rely on a placeholder — see `convertMessages` for the placeholder injection.
+		requiresReasoningContentForToolCalls:
+			isKimiModel ||
+			(isDeepseekFamily && Boolean(model.reasoning)) ||
+			((provider === "openrouter" || baseUrl.includes("openrouter.ai")) && Boolean(model.reasoning)),
+		// DeepSeek V4 rejects synthetic reasoning_content placeholders (".") on tool-call turns.
+		// Kimi and OpenRouter accept them when actual reasoning is unavailable.
+		allowsSyntheticReasoningContentForToolCalls: !isDeepseekFamily || !model.reasoning,
 		requiresAssistantContentForToolCalls: isKimiModel,
 		openRouterRouting: undefined,
 		vercelGatewayRouting: undefined,
 		supportsStrictMode: detectStrictModeSupport(provider, baseUrl),
 		extraBody: undefined,
+		toolStrictMode: isCerebras ? "all_strict" : "mixed",
 	};
 }
 
@@ -143,11 +188,17 @@ export function resolveOpenAICompat(
 		reasoningContentField: model.compat.reasoningContentField ?? detected.reasoningContentField,
 		requiresReasoningContentForToolCalls:
 			model.compat.requiresReasoningContentForToolCalls ?? detected.requiresReasoningContentForToolCalls,
+		allowsSyntheticReasoningContentForToolCalls:
+			model.compat.allowsSyntheticReasoningContentForToolCalls ??
+			detected.allowsSyntheticReasoningContentForToolCalls,
 		requiresAssistantContentForToolCalls:
 			model.compat.requiresAssistantContentForToolCalls ?? detected.requiresAssistantContentForToolCalls,
+		disableReasoningOnForcedToolChoice:
+			model.compat.disableReasoningOnForcedToolChoice ?? detected.disableReasoningOnForcedToolChoice,
 		openRouterRouting: model.compat.openRouterRouting ?? detected.openRouterRouting,
 		vercelGatewayRouting: model.compat.vercelGatewayRouting ?? detected.vercelGatewayRouting,
 		supportsStrictMode: model.compat.supportsStrictMode ?? detected.supportsStrictMode,
 		extraBody: model.compat.extraBody,
+		toolStrictMode: model.compat.toolStrictMode ?? detected.toolStrictMode,
 	};
 }

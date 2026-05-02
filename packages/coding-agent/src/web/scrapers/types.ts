@@ -2,6 +2,8 @@
  * Shared types and utilities for web-fetch handlers
  */
 import { ptree } from "@oh-my-pi/pi-utils";
+import type TurndownService from "turndown";
+
 import { ToolAbortError } from "../../tools/tool-errors";
 
 export { formatNumber } from "@oh-my-pi/pi-utils";
@@ -153,41 +155,71 @@ export async function loadPage(url: string, options: LoadPageOptions = {}): Prom
 	return { content: "", contentType: "", finalUrl: url, ok: false };
 }
 
+/** Module-level Turndown instance — built lazily on first use. */
+let turndownPromise: Promise<TurndownService> | undefined;
+
+type TurndownListParent = {
+	nodeName: string;
+	getAttribute(name: string): string | null;
+	children: ArrayLike<unknown>;
+};
+
+function getTurndown(): Promise<TurndownService> {
+	turndownPromise ||= initTurndown();
+	return turndownPromise;
+}
+
+async function initTurndown(): Promise<TurndownService> {
+	const [{ default: TurndownService }, { gfm }] = await Promise.all([
+		import("turndown"),
+		import("turndown-plugin-gfm"),
+	]);
+	const turndown = new TurndownService({
+		headingStyle: "atx",
+		codeBlockStyle: "fenced",
+		bulletListMarker: "-",
+	});
+	turndown.use(gfm);
+	turndown.addRule("strikethrough", {
+		filter: ["del", "s", "strike"],
+		replacement(content) {
+			return `~~${content}~~`;
+		},
+	});
+	turndown.addRule("heading", {
+		filter: ["h1", "h2", "h3", "h4", "h5", "h6"],
+		replacement(content, node) {
+			const level = Number(node.nodeName.charAt(1));
+			const prefix = "#".repeat(level);
+			const cleaned = content.replace(/\\([.])/g, "$1").trim();
+			return `\n\n${prefix} ${cleaned}\n\n`;
+		},
+	});
+	turndown.addRule("listItem", {
+		filter: "li",
+		replacement(content, node, options) {
+			content = content.replace(/^\n+/, "").replace(/\n+$/, "\n").replace(/\n/gm, "\n  ");
+			const parent = node.parentNode as unknown as TurndownListParent | null;
+			let prefix = `${options.bulletListMarker} `;
+			if (parent?.nodeName === "OL") {
+				const start = parent.getAttribute("start");
+				const index = Array.prototype.indexOf.call(parent.children, node);
+				prefix = `${(start ? Number(start) : 1) + index}. `;
+			}
+			return prefix + content + (node.nextSibling ? "\n" : "");
+		},
+	});
+	return turndown;
+}
+
 /**
- * Convert basic HTML to markdown
+ * Convert HTML to markdown using Turndown with GFM support.
+ * Strips script/style tags before conversion.
  */
-export function htmlToBasicMarkdown(html: string): string {
-	const stripped = html
-		.replace(/<pre[^>]*><code[^>]*>/g, "\n```\n")
-		.replace(/<\/code><\/pre>/g, "\n```\n")
-		.replace(/<code[^>]*>/g, "`")
-		.replace(/<\/code>/g, "`")
-		.replace(/<strong[^>]*>/g, "**")
-		.replace(/<\/strong>/g, "**")
-		.replace(/<b[^>]*>/g, "**")
-		.replace(/<\/b>/g, "**")
-		.replace(/<em[^>]*>/g, "*")
-		.replace(/<\/em>/g, "*")
-		.replace(/<i[^>]*>/g, "*")
-		.replace(/<\/i>/g, "*")
-		.replace(
-			/<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g,
-			(_, href, text) => `[${text.replace(/<[^>]+>/g, "").trim()}](${href})`,
-		)
-		.replace(/<p[^>]*>/g, "\n\n")
-		.replace(/<\/p>/g, "")
-		.replace(/<br\s*\/?>/g, "\n")
-		.replace(/<li[^>]*>/g, "- ")
-		.replace(/<\/li>/g, "\n")
-		.replace(/<\/?[uo]l[^>]*>/g, "\n")
-		.replace(/<h(\d)[^>]*>/g, (_, n) => `\n${"#".repeat(parseInt(n, 10))} `)
-		.replace(/<\/h\d>/g, "\n")
-		.replace(/<blockquote[^>]*>/g, "\n> ")
-		.replace(/<\/blockquote>/g, "\n")
-		.replace(/<[^>]+>/g, "")
-		.replace(/\n{3,}/g, "\n\n")
-		.trim();
-	return decodeHtmlEntities(stripped);
+export async function htmlToBasicMarkdown(html: string): Promise<string> {
+	const cleaned = html.replace(/<script[\s\S]*?<\/script>/gi, "").replace(/<style[\s\S]*?<\/style>/gi, "");
+	const turndown = await getTurndown();
+	return turndown.turndown(cleaned).trim();
 }
 
 /**
@@ -263,5 +295,18 @@ export function getLocalizedText(value: LocalizedText, defaultLocale?: string): 
 	if (defaultLocale && value[defaultLocale]) return value[defaultLocale];
 	return (
 		value["en-US"] ?? value.en_US ?? value.en ?? Object.values(value).find(v => typeof v === "string") ?? undefined
+	);
+}
+
+/**
+ * Check if content looks like HTML by inspecting the leading tag.
+ */
+export function looksLikeHtml(content: string): boolean {
+	const trimmed = content.trim().toLowerCase();
+	return (
+		trimmed.startsWith("<!doctype") ||
+		trimmed.startsWith("<html") ||
+		trimmed.startsWith("<head") ||
+		trimmed.startsWith("<body")
 	);
 }

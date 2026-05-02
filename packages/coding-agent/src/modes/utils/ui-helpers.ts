@@ -8,7 +8,7 @@ import { BranchSummaryMessageComponent } from "../../modes/components/branch-sum
 import { CompactionSummaryMessageComponent } from "../../modes/components/compaction-summary-message";
 import { CustomMessageComponent } from "../../modes/components/custom-message";
 import { DynamicBorder } from "../../modes/components/dynamic-border";
-import { PythonExecutionComponent } from "../../modes/components/python-execution";
+import { EvalExecutionComponent } from "../../modes/components/eval-execution";
 import { ReadToolGroupComponent } from "../../modes/components/read-tool-group";
 import { SkillMessageComponent } from "../../modes/components/skill-message";
 import { ToolExecutionComponent } from "../../modes/components/tool-execution";
@@ -84,7 +84,7 @@ export class UiHelpers {
 				break;
 			}
 			case "pythonExecution": {
-				const component = new PythonExecutionComponent(message.code, this.ctx.ui, message.excludeFromContext);
+				const component = new EvalExecutionComponent(message.code, this.ctx.ui, message.excludeFromContext);
 				if (message.output) {
 					component.appendOutput(message.output);
 				}
@@ -125,6 +125,47 @@ export class UiHelpers {
 						const component = new SkillMessageComponent(message as CustomMessage<SkillPromptDetails>);
 						component.setExpanded(this.ctx.toolOutputExpanded);
 						this.ctx.chatContainer.addChild(component);
+						break;
+					}
+					if (
+						message.customType === "irc:incoming" ||
+						message.customType === "irc:autoreply" ||
+						message.customType === "irc:relay"
+					) {
+						const details = (
+							message as CustomMessage<{
+								from?: string;
+								to?: string;
+								message?: string;
+								reply?: string;
+								body?: string;
+								kind?: "message" | "reply";
+							}>
+						).details;
+						let arrow: string;
+						let body: string;
+						if (message.customType === "irc:incoming") {
+							const peer = details?.from ?? "?";
+							body = details?.message ?? "";
+							arrow = `\u21e6 ${peer}`;
+						} else if (message.customType === "irc:autoreply") {
+							const peer = details?.to ?? "?";
+							body = details?.reply ?? "";
+							arrow = `\u21e8 ${peer} (auto)`;
+						} else {
+							const from = details?.from ?? "?";
+							const to = details?.to ?? "?";
+							body = details?.body ?? "";
+							const suffix = details?.kind === "reply" ? " (auto)" : "";
+							arrow = `${from} \u21e8 ${to}${suffix}`;
+						}
+						const header = `${theme.fg("accent", `[IRC] ${arrow}`)}`;
+						this.ctx.chatContainer.addChild(new Text(header, 1, 0));
+						if (body) {
+							for (const line of body.split("\n")) {
+								this.ctx.chatContainer.addChild(new Text(theme.fg("muted", `  ${line}`), 0, 0));
+							}
+						}
 						break;
 					}
 					const renderer = this.ctx.session.extensionRunner?.getMessageRenderer(message.customType);
@@ -209,7 +250,7 @@ export class UiHelpers {
 		sessionContext: SessionContext,
 		options: { updateFooter?: boolean; populateHistory?: boolean } = {},
 	): void {
-		this.ctx.optimisticUserMessageSignature = undefined;
+		// Preserved: message_start handler owns this lifecycle (see #783)
 		this.ctx.pendingTools.clear();
 
 		if (options.updateFooter) {
@@ -257,7 +298,9 @@ export class UiHelpers {
 					if (content.name === "read") {
 						if (hasErrorStop && errorMessage) {
 							if (!readGroup) {
-								readGroup = new ReadToolGroupComponent();
+								readGroup = new ReadToolGroupComponent({
+									showContentPreview: this.ctx.settings.get("read.toolResultPreview"),
+								});
 								readGroup.setExpanded(this.ctx.toolOutputExpanded);
 								this.ctx.chatContainer.addChild(readGroup);
 							}
@@ -297,6 +340,7 @@ export class UiHelpers {
 						tool,
 						this.ctx.ui,
 						this.ctx.sessionManager.getCwd(),
+						content.id,
 					);
 					component.setExpanded(this.ctx.toolOutputExpanded);
 					this.ctx.chatContainer.addChild(component);
@@ -329,7 +373,9 @@ export class UiHelpers {
 					let component = this.ctx.pendingTools.get(message.toolCallId);
 					if (!component) {
 						if (!readGroup) {
-							readGroup = new ReadToolGroupComponent();
+							readGroup = new ReadToolGroupComponent({
+								showContentPreview: this.ctx.settings.get("read.toolResultPreview"),
+							});
 							readGroup.setExpanded(this.ctx.toolOutputExpanded);
 							this.ctx.chatContainer.addChild(readGroup);
 						}
@@ -368,7 +414,7 @@ export class UiHelpers {
 		this.ctx.ui.requestRender();
 	}
 
-	renderInitialMessages(): void {
+	renderInitialMessages(prebuiltContext?: SessionContext): void {
 		// This path is used to rebuild the visible chat transcript (e.g. after custom/debug UI).
 		// Clear existing rendered chat first to avoid duplicating the full session in the container.
 		this.ctx.chatContainer.clear();
@@ -376,8 +422,8 @@ export class UiHelpers {
 		this.ctx.pendingBashComponents = [];
 		this.ctx.pendingPythonComponents = [];
 
-		// Get aligned messages and entries from session context
-		const context = this.ctx.sessionManager.buildSessionContext();
+		// Reuse a pre-built context when available (e.g. from navigateTree) to avoid a second O(N) walk.
+		const context = prebuiltContext ?? this.ctx.sessionManager.buildSessionContext();
 		this.ctx.renderSessionContext(context, {
 			updateFooter: true,
 			populateHistory: true,
@@ -564,9 +610,22 @@ export class UiHelpers {
 				await this.ctx.session.prompt(message.text);
 			}
 
-			const promptPromise = this.ctx.session.prompt(firstPrompt.text).catch((error: unknown) => {
-				restoreQueue(error);
-			});
+			// Pass streamingBehavior so that if the session is still streaming when
+			// compaction-end fires (race window between isStreaming flipping false and
+			// the event landing here), prompt() routes the message into the steer/
+			// follow-up queue instead of throwing AgentBusyError. When the session is
+			// genuinely idle, streamingBehavior is ignored and a fresh prompt runs as
+			// before. This keeps the steer preview honest: if delivery has to be
+			// deferred, the message lands in the same queue every other consumer
+			// (Alt+Up dequeue, post-stream drain) already drains, instead of being
+			// stranded in compactionQueuedMessages with no drainer.
+			const promptPromise = this.ctx.session
+				.prompt(firstPrompt.text, {
+					streamingBehavior: firstPrompt.mode === "followUp" ? "followUp" : "steer",
+				})
+				.catch((error: unknown) => {
+					restoreQueue(error);
+				});
 
 			for (const message of rest) {
 				if (this.ctx.isKnownSlashCommand(message.text)) {

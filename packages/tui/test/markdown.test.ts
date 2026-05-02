@@ -680,6 +680,43 @@ more text`,
 		});
 	});
 
+	describe("Mermaid fenced blocks", () => {
+		const renderMermaidLines = (text: string, resolveMermaidAscii: (source: string) => string | null) => {
+			const markdown = new Markdown(text, 0, 0, { ...defaultMarkdownTheme, resolveMermaidAscii });
+
+			return markdown.render(80).map(line => line.replace(/\x1b\[[0-9;]*m/g, "").trimEnd());
+		};
+
+		it("renders resolver ASCII only when the mermaid source matches", () => {
+			const fencedMermaid = "```mermaid\nflowchart TD\n  Start-->Stop\n```";
+			const mermaidSource = "flowchart TD\n  Start-->Stop";
+			const seenSources: string[] = [];
+
+			const plainLines = renderMermaidLines(fencedMermaid, source => {
+				seenSources.push(source);
+				return source === mermaidSource ? "Start\n  |\nStop" : null;
+			});
+
+			expect(seenSources).toEqual([mermaidSource]);
+			expect(plainLines).toEqual(["Start", "  |", "Stop"]);
+			expect(plainLines.some(line => line.includes("```mermaid"))).toBeFalsy();
+		});
+
+		it("falls back to the original fenced code block when mermaid resolution returns null", () => {
+			const invalidMermaid = "```mermaid\nflowchart TD\n  A --\n```";
+			const invalidSource = "flowchart TD\n  A --";
+			const seenSources: string[] = [];
+
+			const plainLines = renderMermaidLines(invalidMermaid, source => {
+				seenSources.push(source);
+				return null;
+			});
+
+			expect(seenSources).toEqual([invalidSource]);
+			expect(plainLines).toEqual(["```mermaid", "  flowchart TD", "    A --", "```"]);
+		});
+	});
+
 	describe("Spacing after dividers", () => {
 		it("should have only one blank line between divider and following paragraph", () => {
 			const markdown = new Markdown(
@@ -1103,5 +1140,37 @@ bar`,
 				"Should render HTML in code blocks",
 			).toBeTruthy();
 		});
+	});
+});
+
+describe("Module-level LRU render cache", () => {
+	it("invokes highlightCode only once for two distinct instances with identical (text, width, theme)", () => {
+		// Build a theme with a spy on highlightCode. The theme object reference
+		// is stable across both instances so objectId() returns the same ID,
+		// meaning the L2 cache key is identical for both renders.
+		let highlightCallCount = 0;
+		const themeWithSpy = {
+			...defaultMarkdownTheme,
+			highlightCode: (code: string, _lang?: string): string[] => {
+				highlightCallCount++;
+				return [code]; // trivial passthrough
+			},
+		};
+
+		const text = "```js\nconst x = 1;\n```";
+		const width = 80;
+
+		// First instance: cold cache → highlightCode MUST be called.
+		const md1 = new Markdown(text, 0, 0, themeWithSpy);
+		const lines1 = md1.render(width);
+		expect(highlightCallCount, "First render should call highlightCode exactly once").toBe(1);
+
+		// Second distinct instance with identical inputs: L2 cache hit → highlightCode must NOT be called again.
+		const md2 = new Markdown(text, 0, 0, themeWithSpy);
+		const lines2 = md2.render(width);
+		expect(highlightCallCount, "Second render (different instance, same key) must use L2 cache").toBe(1);
+
+		// Output must be byte-identical — cache is transparent to callers.
+		expect(lines2).toEqual(lines1);
 	});
 });

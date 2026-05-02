@@ -12,20 +12,10 @@ import type {
 import type { AssistantMessage, Context, Message, Model, ToolResultMessage, UserMessage } from "@oh-my-pi/pi-ai";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { Type } from "@sinclair/typebox";
+import { createAssistantMessage, pushAlphaThenDoneEvent } from "./helpers";
 
 // Mock stream for testing - uses actual AssistantMessageEventStream with throttling
 class MockAssistantStream extends AssistantMessageEventStream {}
-
-function createUsage() {
-	return {
-		input: 0,
-		output: 0,
-		cacheRead: 0,
-		cacheWrite: 0,
-		totalTokens: 0,
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-	};
-}
 
 function createModel(): Model<"openai-responses"> {
 	return {
@@ -39,22 +29,6 @@ function createModel(): Model<"openai-responses"> {
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 8192,
 		maxTokens: 2048,
-	};
-}
-
-function createAssistantMessage(
-	content: AssistantMessage["content"],
-	stopReason: AssistantMessage["stopReason"] = "stop",
-): AssistantMessage {
-	return {
-		role: "assistant",
-		content,
-		api: "openai-responses",
-		provider: "openai",
-		model: "mock",
-		usage: createUsage(),
-		stopReason,
-		timestamp: Date.now(),
 	};
 }
 
@@ -117,6 +91,37 @@ describe("agentLoop with AgentMessage", () => {
 		expect(eventTypes).toContain("message_end");
 		expect(eventTypes).toContain("turn_end");
 		expect(eventTypes).toContain("agent_end");
+	});
+
+	it("emits an aborted assistant message when cancellation happens before provider events", async () => {
+		const context: AgentContext = {
+			systemPrompt: "You are helpful.",
+			messages: [],
+			tools: [],
+		};
+		const userPrompt: AgentMessage = createUserMessage("Hello");
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+		};
+		const controller = new AbortController();
+		const streamFn = () => new MockAssistantStream();
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([userPrompt], context, config, controller.signal, streamFn);
+		queueMicrotask(() => controller.abort());
+
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const messages = await stream.result();
+		const finalMessage = messages[messages.length - 1];
+		expect(finalMessage.role).toBe("assistant");
+		if (finalMessage.role !== "assistant") throw new Error("Expected assistant message");
+		expect(finalMessage.stopReason).toBe("aborted");
+		expect(finalMessage.errorMessage).toBe("Request was aborted");
+		expect(events.map(event => event.type)).toContain("agent_end");
 	});
 
 	it("should handle custom message types via convertToLlm", async () => {
@@ -570,7 +575,7 @@ describe("agentLoop with AgentMessage", () => {
 			const stream = new MockAssistantStream();
 			queueMicrotask(() => {
 				const partial = createAssistantMessage(
-					[{ type: "toolCall", id: "tool-1", name: "submit_result", arguments: { data: { ok: true } } }],
+					[{ type: "toolCall", id: "tool-1", name: "yield", arguments: { data: { ok: true } } }],
 					"toolUse",
 				);
 				stream.push({ type: "start", partial });
@@ -767,16 +772,7 @@ it("refreshes tools and system prompt between same-turn model calls", async () =
 		callContexts.push(llmContext);
 		const stream = new MockAssistantStream();
 		queueMicrotask(() => {
-			if (callIndex === 0) {
-				const message = createAssistantMessage(
-					[{ type: "toolCall", id: "tool-1", name: "alpha", arguments: { value: "hello" } }],
-					"toolUse",
-				);
-				stream.push({ type: "done", reason: "toolUse", message });
-			} else {
-				const message = createAssistantMessage([{ type: "text", text: "done" }]);
-				stream.push({ type: "done", reason: "stop", message });
-			}
+			pushAlphaThenDoneEvent(stream, callIndex, createAssistantMessage);
 			callIndex += 1;
 		});
 		return stream;

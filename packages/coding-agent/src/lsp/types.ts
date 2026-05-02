@@ -15,24 +15,32 @@ export const lspSchema = Type.Object({
 			"hover",
 			"symbols",
 			"rename",
+			"rename_file",
 			"code_actions",
 			"type_definition",
 			"implementation",
 			"status",
 			"reload",
+			"capabilities",
+			"request",
 		],
 		{ description: "LSP operation" },
 	),
-	file: Type.Optional(Type.String({ description: "File path" })),
+	file: Type.Optional(Type.String({ description: "File path or source path for rename_file" })),
 	line: Type.Optional(Type.Number({ description: "Line number (1-indexed)" })),
-	symbol: Type.Optional(
-		Type.String({ description: "Symbol/substring to locate on the line (used to compute column)" }),
+	symbol: Type.Optional(Type.String({ description: "Symbol/substring to locate on the line" })),
+	query: Type.Optional(
+		Type.String({ description: "Search query, code-action selector, or LSP method name for action=request" }),
 	),
-	occurrence: Type.Optional(Type.Number({ description: "Symbol occurrence on line (1-indexed, default: 1)" })),
-	query: Type.Optional(Type.String({ description: "Search query or SSR pattern" })),
-	new_name: Type.Optional(Type.String({ description: "New name for rename" })),
-	apply: Type.Optional(Type.Boolean({ description: "Apply edits (default: true)" })),
+	new_name: Type.Optional(Type.String({ description: "New name for rename, or destination path for rename_file" })),
+	apply: Type.Optional(Type.Boolean({ description: "Apply edits (default: true for rename/rename_file)" })),
 	timeout: Type.Optional(Type.Number({ description: "Request timeout in seconds" })),
+	payload: Type.Optional(
+		Type.String({
+			description:
+				"JSON-encoded params for action=request. When omitted, params are auto-built from file/line/symbol.",
+		}),
+	),
 });
 
 export type LspParams = Static<typeof lspSchema>;
@@ -411,6 +419,14 @@ export interface LspClient {
 	isReading: boolean;
 	serverCapabilities?: LspServerCapabilities;
 	lastActivity: number;
+	/** Serializes outbound JSON-RPC writes to the server process. */
+	writeQueue: Promise<void>;
+	/** Tracks active work-done progress tokens from the server */
+	activeProgressTokens: Set<string | number>;
+	/** Resolves when the server's initial project loading completes (or after timeout) */
+	projectLoaded: Promise<void>;
+	/** Call to signal that project loading has completed */
+	resolveProjectLoaded: () => void;
 }
 
 // =============================================================================

@@ -14,7 +14,7 @@ import type {
 	TextContent,
 	ToolResultMessage,
 } from "@oh-my-pi/pi-ai";
-import { renderPromptTemplate } from "../config/prompt-templates";
+import { prompt } from "@oh-my-pi/pi-utils";
 import branchSummaryContextPrompt from "../prompts/compaction/branch-summary-context.md" with { type: "text" };
 import compactionSummaryContextPrompt from "../prompts/compaction/compaction-summary-context.md" with { type: "text" };
 import type { OutputMeta } from "../tools/output-meta";
@@ -59,7 +59,7 @@ export interface BashExecutionMessage {
 
 /**
  * Message type for user-initiated Python executions via the $ command.
- * Shares the same kernel session as the agent's Python tool.
+ * Shares the same kernel session as eval's Python backend.
  */
 export interface PythonExecutionMessage {
 	role: "pythonExecution";
@@ -310,7 +310,7 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 						content: [
 							{
 								type: "text" as const,
-								text: renderPromptTemplate(BRANCH_SUMMARY_TEMPLATE, { summary: m.summary }),
+								text: prompt.render(BRANCH_SUMMARY_TEMPLATE, { summary: m.summary }),
 							},
 						],
 						attribution: "agent",
@@ -322,7 +322,7 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 						content: [
 							{
 								type: "text" as const,
-								text: renderPromptTemplate(COMPACTION_SUMMARY_TEMPLATE, { summary: m.summary }),
+								text: prompt.render(COMPACTION_SUMMARY_TEMPLATE, { summary: m.summary }),
 							},
 						],
 						attribution: "agent",

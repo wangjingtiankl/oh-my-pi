@@ -145,6 +145,24 @@ const OPTION_PROVIDERS: Partial<Record<SettingPath, OptionProvider>> = {
 		},
 		{ value: "never", label: "Never", description: "Stay on the fallback model until manually changed" },
 	],
+	// Task input mode
+	"task.simple": [
+		{
+			value: "default",
+			label: "Default",
+			description: "Shared context and custom task schema are available",
+		},
+		{
+			value: "schema-free",
+			label: "Schema-free",
+			description: "Shared context stays available, but custom task schema is disabled",
+		},
+		{
+			value: "independent",
+			label: "Independent",
+			description: "No shared context or custom task schema; each task must stand alone",
+		},
+	],
 	// Task max concurrency
 	"task.maxConcurrency": [
 		{ value: "0", label: "Unlimited" },
@@ -196,15 +214,15 @@ const OPTION_PROVIDERS: Partial<Record<SettingPath, OptionProvider>> = {
 		{ value: "3", label: "3 reminders" },
 		{ value: "5", label: "5 reminders" },
 	],
-	// Grep context
-	"grep.contextBefore": [
+	// Search context
+	"search.contextBefore": [
 		{ value: "0", label: "0 lines" },
 		{ value: "1", label: "1 line" },
 		{ value: "2", label: "2 lines" },
 		{ value: "3", label: "3 lines" },
 		{ value: "5", label: "5 lines" },
 	],
-	"grep.contextAfter": [
+	"search.contextAfter": [
 		{ value: "0", label: "0 lines" },
 		{ value: "1", label: "1 line" },
 		{ value: "2", label: "2 lines" },
@@ -330,9 +348,15 @@ const OPTION_PROVIDERS: Partial<Record<SettingPath, OptionProvider>> = {
 		{ value: "kagi", label: "Kagi", description: "Requires KAGI_API_KEY and Kagi Search API beta access" },
 		{ value: "synthetic", label: "Synthetic", description: "Requires SYNTHETIC_API_KEY" },
 		{ value: "parallel", label: "Parallel", description: "Requires PARALLEL_API_KEY" },
+		{ value: "searxng", label: "SearXNG", description: "Requires searxng.endpoint" },
 	],
 	"providers.image": [
-		{ value: "auto", label: "Auto", description: "Priority: OpenRouter > Gemini" },
+		{
+			value: "auto",
+			label: "Auto",
+			description: "Priority: GPT model image tool > Antigravity > OpenRouter > Gemini",
+		},
+		{ value: "openai", label: "OpenAI", description: "Uses the active GPT Responses/Codex model" },
 		{ value: "gemini", label: "Gemini", description: "Requires GEMINI_API_KEY" },
 		{ value: "openrouter", label: "OpenRouter", description: "Requires OPENROUTER_API_KEY" },
 	],
@@ -425,6 +449,16 @@ const OPTION_PROVIDERS: Partial<Record<SettingPath, OptionProvider>> = {
 		{ value: "block", label: "Block", description: "Solid blocks" },
 		{ value: "none", label: "None", description: "Space only" },
 		{ value: "ascii", label: "ASCII", description: "Greater-than signs" },
+	],
+	// Loop mode
+	"loop.mode": [
+		{
+			value: "prompt",
+			label: "Prompt",
+			description: "Re-submit the prompt as a follow-up message (current behavior)",
+		},
+		{ value: "compact", label: "Compact", description: "Compact the session context, then re-submit the prompt" },
+		{ value: "reset", label: "Reset", description: "Start a new session, then re-submit the prompt" },
 	],
 };
 

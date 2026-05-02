@@ -1,6 +1,27 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+
+- Fixed request cancellation before provider events by emitting an aborted assistant message and ending the stream with `stopReason: "aborted"`
+
+## [14.5.10] - 2026-04-30
+
+### Added
+
+- Added an `onResponse` stream option for observing provider response metadata after response headers arrive.
+
+## [14.2.0] - 2026-04-23
+
+### Changed
+
+- Changed tool dispatch to match model-returned tool calls by either internal tool name or custom wire name, enabling custom OpenAI tool names such as `apply_patch`.
+
+## [14.0.1] - 2026-04-08
+### Added
+
+- Added `onAssistantMessageEvent` callback option to inspect assistant streaming events before they are emitted, enabling abort decisions before buffered events continue flowing
+- Added `setAssistantMessageEventInterceptor()` method to dynamically set or update the assistant message event interceptor
 
 ## [13.13.0] - 2026-03-18
 

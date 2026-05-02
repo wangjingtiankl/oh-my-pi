@@ -17,7 +17,7 @@ src/
 ├── mcp/                 # MCP transport/manager/loader/tool bridge
 ├── lsp/                 # language server client/runtime integration
 ├── internal-urls/       # protocol router + handlers (agent://, docs://, rule://, ...)
-├── exec/ ipy/ ssh/      # execution backends (shell, python, ssh)
+├── exec/ eval/ ssh/     # execution backends (shell, eval runtimes, ssh)
 ├── web/                 # search providers + domain scrapers
 ├── patch/               # edit/patch parser + applicator + diff utilities
 └── config/ utils/ tui/  # settings, helpers, low-level TUI primitives
@@ -99,7 +99,7 @@ createAgentSession(...)
 
 - **Core runtime/session APIs**: `createAgentSession`, `AgentSession`, `SessionManager`, prompt/compaction/session types.
 - **Mode APIs**: `InteractiveMode`, `runPrintMode`, `runRpcMode`, `RpcClient` and RPC event/types.
-- **Discovery + tool constructors**: `discoverAuthStorage`, `discoverExtensions`, `discoverMCPServers`, `createTools`, built-in tool classes (`ReadTool`, `WriteTool`, `BashTool`, `PythonTool`, `FindTool`, `GrepTool`, `EditTool`).
+- **Discovery + tool constructors**: `discoverAuthStorage`, `discoverExtensions`, `discoverMCPServers`, `createTools`, built-in tool classes (`ReadTool`, `WriteTool`, `BashTool`, `EvalTool`, `FindTool`, `GrepTool`, `EditTool`).
 - **Extensibility interfaces**: extension/custom-command/custom-tool/skill/slash-command types and loaders.
 - **UI/theming helpers**: TUI components plus `initTheme`, `Theme`, and code-highlighting/theme utilities.
 - **CLI callable export**: `main` is re-exported for embedding/integration contexts that invoke root behavior explicitly.
@@ -390,12 +390,12 @@ A `ToolFactory` is `(session: ToolSession) => Tool | null | Promise<Tool | null>
 `createTools(session, toolNames?)` is the entry point. It:
 
 1. Normalizes requested tool names (`toolNames`) and always injects `exit_plan_mode`.
-2. Resolves Python mode via `PI_PY` override (`getPythonModeFromEnv()`) or `session.settings.get("python.toolMode")`.
-3. Performs Python kernel preflight/warmup when applicable (`checkPythonKernelAvailability`, `warmPythonEnvironment`).
+2. Resolves eval backend allowance via `PI_PY` override (`getEvalBackendsFromEnv()`) or `eval.py` / `eval.js` settings.
+3. Performs Python kernel preflight when applicable (`checkPythonKernelAvailability`).
 4. Computes effective gating (`isToolAllowed`) from settings and runtime state:
    - feature toggles (`find.enabled`, `grep.enabled`, etc.)
    - recursion guard for `task` (`task.maxRecursionDepth` vs `session.taskDepth`)
-   - submit-result mode (`requireSubmitResultTool`) and `todo_write` suppression
+   - yield mode (`requireYieldTool`) and `todo_write` suppression
 5. Instantiates selected tools in parallel with `Promise.all`, records slow factory timings when `PI_TIMING=1`, and wraps results with `wrapToolWithMetaNotice`.
 6. Includes `resolve` only when at least one instantiated tool has `deferrable: true` (deferred preview/apply workflows).
 
@@ -672,7 +672,7 @@ internal URL input (rule://, docs://, ...)
   - convert to agent tools using `MCPTool.fromTools(connection, serverTools)`
 - Startup is bounded by `STARTUP_TIMEOUT_MS` (250ms). If tool loads are still pending, cached definitions may be used from `MCPToolCache` and exposed as deferred wrappers via `DeferredMCPTool.fromTools(...)`.
 - Lifecycle operations:
-  - `disconnectServer(name)` and `disconnectAll()` tear down connections via `disconnectServer(connection)` and remove associated `mcp_<server>_` tools.
+  - `disconnectServer(name)` and `disconnectAll()` tear down connections via `disconnectServer(connection)` and remove associated `mcp__<server>_` tools.
   - `refreshServerTools(name)` / `refreshAllTools()` re-run `listTools()` and replace server tool registrations.
 
 `discoverAndLoadMCPTools()` in `src/mcp/loader.ts` is the adapter from manager internals to extensibility-facing output:
@@ -741,10 +741,10 @@ This keeps URL protocol resolution centralized and pluggable while keeping proto
 ### ASCII overview
 
 ```text
-Tool adapters (tools/bash.ts, tools/python.ts, tools/ssh.ts)
+Tool adapters (tools/bash.ts, tools/eval.ts, tools/ssh.ts)
                 │ schema + validation + onUpdate + error policy
                 ▼
-Executors (exec/bash-executor.ts, ipy/executor.ts, ssh/ssh-executor.ts)
+Executors (exec/bash-executor.ts, eval/py/executor.ts, ssh/ssh-executor.ts)
                 │ process/kernel/session lifecycle
                 ▼
             OutputSink
@@ -755,8 +755,8 @@ Executors (exec/bash-executor.ts, ipy/executor.ts, ssh/ssh-executor.ts)
 
 This subsystem is split into two layers:
 
-- **Core executors** (`src/exec/bash-executor.ts`, `src/ipy/executor.ts`, `src/ssh/ssh-executor.ts`) own process/kernel lifecycle and raw output capture.
-- **Tool adapters** (`src/tools/bash.ts`, `src/tools/python.ts`) own tool schemas, argument normalization, UX-facing updates, and error policy for agent tool calls.
+- **Core executors** (`src/exec/bash-executor.ts`, `src/eval/py/executor.ts`, `src/ssh/ssh-executor.ts`) own process/kernel lifecycle and raw output capture.
+- **Tool adapters** (`src/tools/bash.ts`, `src/tools/eval.ts`) own tool schemas, argument normalization, UX-facing updates, and error policy for agent tool calls.
 
 ### Core executor responsibilities
 
@@ -772,12 +772,12 @@ This subsystem is split into two layers:
   - `output`, `truncated`, `totalLines/totalBytes`, `outputLines/outputBytes`, optional `artifactId`
   - `exitCode` / `cancelled` states for normal completion, timeout, and abort.
 
-#### Python executor (`src/ipy/executor.ts`)
+#### Python executor (`src/eval/py/executor.ts`)
 
 - Entry points:
   - `executePython(code, options)`
   - `executePythonWithKernel(kernel, code, options)`
-  - warmup/session utilities (`warmPythonEnvironment`, `disposeAllKernelSessions`).
+  - session utilities (`disposeAllKernelSessions`, `disposeKernelSessionsByOwner`).
 - Manages kernel session lifecycle in `kernelSessions: Map<string, KernelSession>` with:
   - bounded session count (`MAX_KERNEL_SESSIONS`), LRU eviction (`evictOldestSession`)
   - idle cleanup timer (`cleanupIdleSessions`)
@@ -819,11 +819,11 @@ This subsystem is split into two layers:
   - converts backend cancellation/timeout/exit status into `ToolAbortError` / `ToolError`
   - returns `toolResult(...).text(...).truncationFromSummary(...)`.
 
-#### Python tool (`src/tools/python.ts`)
+#### Eval tool (`src/tools/eval.ts`)
 
-- Adapter class: `PythonTool implements AgentTool<typeof pythonSchema>`.
-- Defines schema (`cells[]`, `timeout`, `cwd`, `reset`) and dynamic description from prelude docs (`getPythonToolDescription`, `getPreludeDocs`).
-- Supports proxy mode via `PythonProxyExecutor`; otherwise executes locally.
+- Adapter class: `EvalTool implements AgentTool<typeof evalSchema>`.
+- Defines schema (`cells[]`, `language`, `timeout`, `reset`) and a static description from `prompts/tools/eval.md` (`getEvalToolDescription`).
+- Supports proxy mode via `EvalProxyExecutor`; otherwise executes locally.
 - Per-call adaptation:
   - validates and resolves working dir
   - clamps timeout and combines abort signals (`AbortSignal.any`)
@@ -864,7 +864,7 @@ mapWithConcurrencyLimit(...)
       └── ...
       │
       ▼
-submit_result/fallback normalization
+yield/fallback normalization
       │
       ▼
 aggregated task results (+ optional worktree patches)
@@ -923,22 +923,22 @@ What _is_ isolated is execution context and artifacts, not process memory:
 
 - Adds `task` tool automatically when `agent.spawns` is set and recursion depth permits.
 - Removes `task` when max recursion depth is reached (`task.maxRecursionDepth`).
-- Expands legacy `exec` alias into `python` and/or `bash` based on `python.toolMode`.
-- Forces `requireSubmitResultTool: true` in `createAgentSession(...)`.
+- Expands legacy `exec` alias into `eval` when any eval backend is enabled, and always includes `bash`.
+- Forces `requireYieldTool: true` in `createAgentSession(...)`.
 - Filters parent-owned tools out of child tools (`todo_write` is removed).
 
 If parent MCP connections exist, executor creates in-process MCP proxy tools with `createMCPProxyTools(...)` so children reuse parent MCP connectivity rather than creating independent MCP sessions.
 
 ## Submit/Result Contract and Completion Semantics
 
-`executor.ts` enforces structured completion around `submit_result`:
+`executor.ts` enforces structured completion around `yield`:
 
 - Tracks tool events and extracted data through `subprocessToolRegistry` handlers.
-- Retries reminder prompts up to 3 times (`MAX_SUBMIT_RESULT_RETRIES`) using `subagent-submit-reminder.md` if `submit_result` was not called.
+- Retries reminder prompts up to 3 times (`MAX_YIELD_RETRIES`) using `subagent-yield-reminder.md` if `yield` was not called.
 - Final output normalization is centralized in `finalizeSubprocessOutput(...)`:
-  - If `submit_result.status === "aborted"`, task is converted to an aborted result payload.
-  - If missing `submit_result`, fallback attempts JSON parse/validation against output schema.
-  - Emits warnings when `submit_result` is missing/null and fallback cannot safely validate.
+  - If `yield.status === "aborted"`, task is converted to an aborted result payload.
+  - If missing `yield`, fallback attempts JSON parse/validation against output schema.
+  - Emits warnings when `yield` is missing/null and fallback cannot safely validate.
 
 This module also accumulates token/cost usage from assistant `message_end` events and truncates returned output with `truncateTail(...)` using `MAX_OUTPUT_BYTES` and `MAX_OUTPUT_LINES`.
 
@@ -1116,7 +1116,7 @@ Use only script names that exist in `packages/coding-agent/package.json`:
 - Regenerate template artifacts:
   - `bun --cwd=packages/coding-agent run generate-template`
 - Build compiled binary artifact (`dist/omp`):
-  - `bun --cwd=packages/coding-agent run build:binary`
+  - `bun --cwd=packages/coding-agent run build`
 
 `packages/coding-agent/README.md` intentionally delegates install/config/CLI docs to the monorepo root README (`../../README.md`) and keeps package-specific references to `CHANGELOG.md`, `docs/`, and `DEVELOPMENT.md`.
 
@@ -1132,7 +1132,7 @@ Primary file: `packages/coding-agent/src/tools/index.ts`.
    - `export const BUILTIN_TOOLS: Record<string, ToolFactory> = { ... }`
    - Key is the external tool name (e.g. `"read"`, `"web_search"`).
 4. If it should be hidden/system-only, register under `HIDDEN_TOOLS` instead.
-   - Existing hidden names: `submit_result`, `report_finding`, `exit_plan_mode`, `resolve`.
+   - Existing hidden names: `yield`, `report_finding`, `exit_plan_mode`, `resolve`.
 5. Wire feature gates in `isToolAllowed(name)` when the tool needs runtime enable/disable behavior.
    - Existing gates use `session.settings.get("<tool>.enabled")` and recursion limits for `task`.
 6. If the tool should be selectable by type, update `ToolName = keyof typeof BUILTIN_TOOLS` consumers as needed.
@@ -1141,8 +1141,8 @@ Notes from current behavior:
 
 - `createTools()` always injects `exit_plan_mode` when `toolNames` are specified.
 - `resolve` is included only when at least one active tool is marked `deferrable: true` (built-in or extension/custom).
-- `submit_result` is force-added when `session.requireSubmitResultTool === true`.
-- Python/Bash availability is mode-driven (`PI_PY`, `python.toolMode`) and can auto-fallback to bash.
+- `yield` is force-added when `session.requireYieldTool === true`.
+- Eval availability is mode-driven (`PI_PY`, `eval.py`, `eval.js`); eval falls back to JavaScript when Python is unavailable and JavaScript is enabled. The standalone `bash` tool is always available.
 
 ### Playbook: add an RPC command
 

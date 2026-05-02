@@ -4,8 +4,8 @@
  * Logs to ~/.omp/logs/ with size-based rotation, supporting concurrent omp instances.
  * Each log entry includes process.pid for traceability.
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import * as fs from "node:fs";
-import { RingBuffer } from "@oh-my-pi/pi-utils/ring";
 import winston from "winston";
 import DailyRotateFile from "winston-daily-rotate-file";
 import { getLogsDir } from "./dirs";
@@ -59,29 +59,6 @@ const winstonLogger = winston.createLogger({
 });
 
 /**
- * Centralized logger for omp.
- *
- * Logs to ~/.omp/logs/omp.YYYY-MM-DD.log with size-based rotation.
- * Safe for concurrent access from multiple omp instances.
- *
- * @example
- * ```typescript
- * import { logger } from "@oh-my-pi/pi-utils";
- *
- * logger.error("MCP request failed", { url, method });
- * logger.warn("Theme file invalid, using fallback", { path });
- * logger.debug("LSP fallback triggered", { reason });
- * ```
- */
-export interface Logger {
-	error(message: string, context?: Record<string, unknown>): void;
-	warn(message: string, context?: Record<string, unknown>): void;
-	debug(message: string, context?: Record<string, unknown>): void;
-	time<T>(op: string, fn: () => T): T;
-	timeAsync<T>(op: string, fn: () => PromiseLike<T>): Promise<T>;
-}
-
-/**
  * Log an error message.
  * @param message - The message to log.
  * @param context - The context to log.
@@ -120,87 +97,260 @@ export function debug(message: string, context?: Record<string, unknown>): void 
 	}
 }
 
-const LOGGED_TIMING_THRESHOLD_MS = 5;
+const LOGGED_TIMING_THRESHOLD_MS = 0.5;
 
-const longOpBuffer = new RingBuffer<[op: string, duration: number]>(1000);
-let longOpRecord = false;
-
-function logTiming(op: string, duration: number): void {
-	duration = Math.round(duration * 100) / 100;
-	if (duration > LOGGED_TIMING_THRESHOLD_MS) {
-		warn(`${op} done`, { duration, op });
-		if (longOpRecord) {
-			longOpBuffer.push([op, duration]);
-		}
-	} else {
-		debug(`${op} done`, { duration, op });
-	}
+interface Span {
+	op: string;
+	start: number;
+	end?: number;
+	parent?: Span;
+	children: Span[];
+	/** Marker / point event without a duration. */
+	point?: boolean;
 }
 
+const spanStorage = new AsyncLocalStorage<Span>();
+let gRootSpan: Span | undefined;
+let gRecordTimings = false;
+
 /**
- * Print all collected long operation timings to stderr.
- * To be called at the end of a startup or timing window.
+ * Print collected timings as an indented tree.
+ * Each span shows wall duration; parents with children also show "(self)" for unattributed time.
+ * Sibling spans are sorted by start time. Spans whose intervals overlap with siblings ran in parallel.
  */
 export function printTimings(): void {
-	// Use stderr for timings output, do not use logger (see AGENTS.md).
-	console.error("\n--- Startup Timings ---");
-	let totalDuration = 0;
-	for (const [op, duration] of longOpBuffer) {
-		console.error(`  ${op}: ${duration}ms`);
-		totalDuration += duration;
+	if (!gRecordTimings || !gRootSpan) {
+		console.error("\n--- Startup Timings ---\n(no markers)\n");
+		return;
 	}
-	console.error(`  TOTAL: ${totalDuration}ms`);
-	console.error("------------------------\n");
+
+	gRootSpan.end = performance.now();
+	const lines: string[] = [];
+	lines.push("");
+	lines.push("--- Startup timings (hierarchical) ---");
+	const work: Span[] = [];
+	const loads: Span[] = [];
+	for (const child of gRootSpan.children) {
+		if (isModuleLoadSpan(child)) loads.push(child);
+		else work.push(child);
+	}
+	for (const child of work.sort((a, b) => a.start - b.start)) {
+		printSpan(child, 0, lines);
+	}
+	if (loads.length > 0) {
+		printModuleLoadSummary(loads, 0, lines);
+	}
+	const totalMs = (gRootSpan.end - gRootSpan.start).toFixed(1);
+	lines.push(`Total: ${totalMs}ms`);
+	lines.push("--------------------------------------");
+	lines.push("");
+	console.error(lines.join("\n"));
+	gRootSpan.end = undefined;
 }
 
 /**
- * Begin recording long operation timings.
- * Typically called at the beginning of startup.
+ * Begin recording startup timings under a new root span.
+ * Idempotent: a second call while already recording is a no-op so that side-effect
+ * starters (see module-timer.ts) and explicit starters (main.ts) can coexist.
  */
 export function startTiming(): void {
-	longOpBuffer.clear();
-	longOpRecord = true;
+	if (gRecordTimings) return;
+	gRootSpan = {
+		op: "(root)",
+		start: performance.now(),
+		parent: undefined,
+		children: [],
+	};
+	gRecordTimings = true;
 }
 
 /**
- * End timing window and print all timings.
- * Disables further buffering until next startTiming().
+ * Record an externally-measured span as a leaf child of the active span (or root
+ * when no span is active). Used by the module-load timing plugin to splice load
+ * events into the tree retroactively.
+ */
+export function recordModuleLoadSpan(path: string, start: number, durationMs: number): void {
+	if (!gRecordTimings || !gRootSpan) return;
+	const parent = spanStorage.getStore() ?? gRootSpan;
+	const span: Span = {
+		op: `load:${shortenLoadPath(path)}`,
+		start,
+		end: start + durationMs,
+		parent,
+		children: [],
+	};
+	parent.children.push(span);
+}
+
+function shortenLoadPath(p: string): string {
+	const cwd = process.cwd();
+	if (p.startsWith(`${cwd}/`)) return p.slice(cwd.length + 1);
+	const home = process.env.HOME;
+	if (home && p.startsWith(`${home}/`)) return `~/${p.slice(home.length + 1)}`;
+	return p;
+}
+
+/**
+ * End timing window and clear buffers.
  */
 export function endTiming(): void {
-	longOpBuffer.clear();
-	longOpRecord = false;
+	gRootSpan = undefined;
+	gRecordTimings = false;
 }
 
-/**
- * Time a synchronous operation and log the duration.
- * @param op - The operation name.
- * @param fn - The function to time.
- * @returns The result of the function.
- */
-export function time<T, A extends unknown[]>(op: string, fn: (...args: A) => T, ...args: A): T {
-	const start = performance.now();
-	try {
-		return fn(...args);
-	} finally {
-		logTiming(op, performance.now() - start);
+function durationOf(span: Span): number {
+	if (span.point || span.end === undefined) return 0;
+	return span.end - span.start;
+}
+
+/** Self time = total - union of child intervals (handles parallel children correctly). */
+function selfTimeOf(span: Span): number {
+	const dur = durationOf(span);
+	if (span.children.length === 0 || span.point) return dur;
+	const intervals = span.children
+		.filter(c => !c.point && c.end !== undefined)
+		.map(c => [c.start, c.end as number] as const)
+		.sort((a, b) => a[0] - b[0]);
+	if (intervals.length === 0) return dur;
+	let union = 0;
+	let curStart = intervals[0][0];
+	let curEnd = intervals[0][1];
+	for (let i = 1; i < intervals.length; i++) {
+		const [s, e] = intervals[i];
+		if (s > curEnd) {
+			union += curEnd - curStart;
+			curStart = s;
+			curEnd = e;
+		} else if (e > curEnd) {
+			curEnd = e;
+		}
+	}
+	union += curEnd - curStart;
+	return Math.max(0, dur - union);
+}
+
+function fmtMs(ms: number): string {
+	if (ms < 1) return `${ms.toFixed(2)}ms`;
+	if (ms < 100) return `${ms.toFixed(1)}ms`;
+	return `${ms.toFixed(0)}ms`;
+}
+
+const MODULE_LOAD_PREFIX = "load:";
+const MODULE_LOAD_VERBOSE_TOP = 10;
+
+function isModuleLoadSpan(span: Span): boolean {
+	return span.op.startsWith(MODULE_LOAD_PREFIX);
+}
+
+function printSpan(span: Span, depth: number, lines: string[]): void {
+	const indent = "  ".repeat(depth);
+	if (span.point) {
+		lines.push(`${indent}• ${span.op}`);
+		return;
+	}
+	const dur = durationOf(span);
+	if (dur < LOGGED_TIMING_THRESHOLD_MS && span.children.length === 0) return;
+	const parallel = isParallel(span);
+	const tag = parallel ? " [parallel]" : "";
+	const self = selfTimeOf(span);
+	const selfStr = span.children.length > 0 && self > LOGGED_TIMING_THRESHOLD_MS ? ` (self ${fmtMs(self)})` : "";
+	lines.push(`${indent}${span.op}: ${fmtMs(dur)}${selfStr}${tag}`);
+
+	// Split children into work spans and module-load spans for summarization.
+	const work: Span[] = [];
+	const loads: Span[] = [];
+	for (const child of span.children) {
+		if (isModuleLoadSpan(child)) loads.push(child);
+		else work.push(child);
+	}
+	for (const child of work.sort((a, b) => a.start - b.start)) {
+		printSpan(child, depth + 1, lines);
+	}
+	if (loads.length > 0) {
+		printModuleLoadSummary(loads, depth + 1, lines);
 	}
 }
 
+/** Collapse the (typically hundreds of) module-load spans into one summary line. */
+function printModuleLoadSummary(loads: Span[], depth: number, lines: string[]): void {
+	const childIndent = "  ".repeat(depth);
+	const grandIndent = "  ".repeat(depth + 1);
+	let unionStart = Number.POSITIVE_INFINITY;
+	let unionEnd = 0;
+	let totalSelf = 0;
+	for (const span of loads) {
+		if (span.end === undefined) continue;
+		if (span.start < unionStart) unionStart = span.start;
+		if (span.end > unionEnd) unionEnd = span.end;
+		totalSelf += span.end - span.start;
+	}
+	const wall = unionEnd > unionStart ? unionEnd - unionStart : 0;
+	lines.push(`${childIndent}(modules): ${loads.length} loaded, wall ${fmtMs(wall)}, sum ${fmtMs(totalSelf)}`);
+	const showAll = process.env.PI_TIMING === "full";
+	const sorted = [...loads].sort((a, b) => durationOf(b) - durationOf(a));
+	const visible = showAll ? sorted : sorted.slice(0, MODULE_LOAD_VERBOSE_TOP);
+	for (const span of visible) {
+		const dur = durationOf(span);
+		if (dur < LOGGED_TIMING_THRESHOLD_MS) break;
+		const tag = isParallel(span) ? " [parallel]" : "";
+		lines.push(`${grandIndent}${span.op}: ${fmtMs(dur)}${tag}`);
+	}
+	if (!showAll && sorted.length > MODULE_LOAD_VERBOSE_TOP) {
+		lines.push(`${grandIndent}… ${sorted.length - MODULE_LOAD_VERBOSE_TOP} more (PI_TIMING=full to show all)`);
+	}
+}
+
+/** A span is parallel if it overlaps a sibling that started before it. */
+function isParallel(span: Span): boolean {
+	const parent = span.parent;
+	if (!parent || span.end === undefined) return false;
+	for (const sibling of parent.children) {
+		if (sibling === span || sibling.end === undefined || sibling.point) continue;
+		// Overlap test: A overlaps B iff A.start < B.end && B.start < A.end
+		if (sibling.start < span.end && span.start < sibling.end) return true;
+	}
+	return false;
+}
+
 /**
- * Time an asynchronous operation and log the duration.
- * @param op - The operation name.
- * @param fn - The function to time.
- * @returns The result of the function.
+ * Time a span. Three forms:
+ *   time(op)                    — point event (zero-duration breadcrumb)
+ *   time(op, fn, ...args)        — wrap fn in a span; returns fn's return value (sync or Promise)
+ *
+ * Spans nest hierarchically via AsyncLocalStorage: a child started inside another span's fn
+ * (even across awaits) becomes that span's child. Parallel children are recorded as siblings
+ * with overlapping intervals.
  */
-export async function timeAsync<R, A extends unknown[]>(
-	op: string,
-	fn: (...args: A) => R,
-	...args: A
-): Promise<Awaited<R>> {
-	const start = performance.now();
+export function time(op: string): void;
+export function time<T, A extends unknown[]>(op: string, fn: (...args: A) => T, ...args: A): T;
+export function time<T, A extends unknown[]>(op: string, fn?: (...args: A) => T, ...args: A): T | undefined {
+	if (!gRecordTimings || !gRootSpan) {
+		if (fn === undefined) return undefined as T;
+		return fn(...args);
+	}
+
+	const parent = spanStorage.getStore() ?? gRootSpan;
+	const span: Span = { op, start: performance.now(), parent, children: [] };
+	parent.children.push(span);
+
+	if (fn === undefined) {
+		span.end = span.start;
+		span.point = true;
+		return undefined as T;
+	}
+
+	const finish = (): void => {
+		span.end = performance.now();
+	};
 	try {
-		return await fn(...args);
-	} finally {
-		logTiming(op, performance.now() - start);
+		const result = spanStorage.run(span, () => fn(...args));
+		if (result instanceof Promise) {
+			return result.finally(finish) as T;
+		}
+		finish();
+		return result;
+	} catch (error) {
+		finish();
+		throw error;
 	}
 }

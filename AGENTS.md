@@ -339,7 +339,7 @@ const wrapped = Bun.wrapAnsi(text, width, {
 | File read/write | `Bun.file()`, `Bun.write()`           | `readFileSync`, `writeFileSync` |
 | Spawn process   | `$\`cmd\``, `Bun.spawn()`             | `child_process`                 |
 | Sleep           | `Bun.sleep(ms)`                       | `setTimeout` promise            |
-| Binary lookup   | `Bun.which("git")`                    | `spawnSync(["which", "git"])`   |
+| Binary lookup   | `$which("git")` from `@oh-my-pi/pi-utils` | `spawnSync(["which", "git"])`   |
 | HTTP server     | `Bun.serve()`                         | `http.createServer()`           |
 | SQLite          | `bun:sqlite`                          | `better-sqlite3`                |
 | Hashing         | `Bun.hash()`, Web Crypto              | `node:crypto`                   |
@@ -375,6 +375,19 @@ const valid = await Bun.password.verify("password", hash);
 - `text.split("\n").map(JSON.parse)` for JSONL → use `Bun.JSONL.parse()`
 - Custom `visibleWidth()` / `get-east-asian-width` → use `Bun.stringWidth()`
 - Custom ANSI-aware text wrapping → use `Bun.wrapAnsi()`
+
+## Generated Files
+
+**NEVER edit `packages/ai/src/models.json` directly.** It is generated from upstream sources (models.dev, provider catalog discovery, OpenCode docs) by `packages/ai/scripts/generate-models.ts` and the descriptors/resolvers in `packages/ai/src/provider-models/`. Any hand-edit will be overwritten the next time the generator runs.
+
+To change a model entry (api type, baseUrl, cost, context, reasoning metadata, etc.), fix the source instead:
+
+- **Resolution rules / per-id overrides** (e.g. when models.dev mislabels a model's `provider.npm` for an OpenCode-style endpoint) → edit the relevant resolver in `packages/ai/src/provider-models/openai-compat.ts` (e.g. `createOpenCodeApiResolution`'s id-override map).
+- **Provider descriptors** (filtering, transforms, defaults, headers, compat overrides, per-model api resolution) → edit `packages/ai/src/provider-models/descriptors.ts` or the provider-specific descriptor in `packages/ai/src/provider-models/`.
+- **Generator-level fixups** (premium multipliers, codex pricing fallback, fallback models, post-processing) → edit `packages/ai/scripts/generate-models.ts`.
+- **Thinking metadata / generated policies** → edit `packages/ai/src/model-thinking.ts` (`applyGeneratedModelPolicies`).
+
+After fixing the source, regenerate with `bun --cwd=packages/ai run generate-models` and commit the resulting `models.json` alongside the source change. Add a regression test against the resolver / descriptor (not against the bundled JSON) so the fix survives the next regeneration even if upstream metadata shifts.
 
 ## Logging
 

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import { disposeAllKernelSessions, executePython } from "@oh-my-pi/pi-coding-agent/ipy/executor";
-import * as pythonKernel from "@oh-my-pi/pi-coding-agent/ipy/kernel";
+import { disposeAllKernelSessions, executePython } from "@oh-my-pi/pi-coding-agent/eval/py/executor";
+import * as pythonKernel from "@oh-my-pi/pi-coding-agent/eval/py/kernel";
 
 class FakeKernel {
 	executeCalls = 0;
@@ -25,9 +25,10 @@ class FakeKernel {
 		return this.alive;
 	}
 
-	async shutdown(): Promise<void> {
+	async shutdown(): Promise<pythonKernel.KernelShutdownResult> {
 		this.shutdownCalls += 1;
 		this.alive = false;
+		return { confirmed: true };
 	}
 }
 

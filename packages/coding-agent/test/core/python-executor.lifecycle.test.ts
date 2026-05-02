@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { disposeAllKernelSessions, executePython } from "@oh-my-pi/pi-coding-agent/ipy/executor";
+import { disposeAllKernelSessions, executePython } from "@oh-my-pi/pi-coding-agent/eval/py/executor";
 import {
 	type KernelExecuteOptions,
 	type KernelExecuteResult,
+	type KernelShutdownResult,
 	PythonKernel,
-} from "@oh-my-pi/pi-coding-agent/ipy/kernel";
+} from "@oh-my-pi/pi-coding-agent/eval/py/kernel";
 
 Bun.env.PI_PYTHON_SKIP_CHECK = "1";
 
@@ -34,9 +35,10 @@ class FakeKernel {
 		return this.#result;
 	}
 
-	async shutdown(): Promise<void> {
+	async shutdown(): Promise<KernelShutdownResult> {
 		this.shutdownCalls += 1;
 		this.#alive = false;
+		return { confirmed: true };
 	}
 
 	async ping(): Promise<boolean> {
@@ -172,11 +174,13 @@ describe("executePython session lifecycle", () => {
 			return kernels.shift() as unknown as PythonKernel;
 		};
 
-		kernelA.shutdown = async () => {
+		kernelA.shutdown = async (): Promise<KernelShutdownResult> => {
 			shutdownCount += 1;
+			return { confirmed: true };
 		};
-		kernelB.shutdown = async () => {
+		kernelB.shutdown = async (): Promise<KernelShutdownResult> => {
 			shutdownCount += 1;
+			return { confirmed: true };
 		};
 
 		await executePython("print('one')", { kernelMode: "per-call" });

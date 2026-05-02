@@ -1,6 +1,6 @@
 import * as fs from "node:fs/promises";
 import { type AgentMessage, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
-import { copyToClipboard, readImageFromClipboard, sanitizeText } from "@oh-my-pi/pi-natives";
+import { sanitizeText } from "@oh-my-pi/pi-natives";
 import type { AutocompleteProvider, SlashCommand } from "@oh-my-pi/pi-tui";
 import { $env } from "@oh-my-pi/pi-utils";
 import { settings } from "../../config/settings";
@@ -10,8 +10,9 @@ import type { InteractiveModeContext } from "../../modes/types";
 import type { AgentSessionEvent } from "../../session/agent-session";
 import { SKILL_PROMPT_MESSAGE_TYPE, type SkillPromptDetails } from "../../session/messages";
 import { executeBuiltinSlashCommand } from "../../slash-commands/builtin-registry";
+import { copyToClipboard, readImageFromClipboard } from "../../utils/clipboard";
 import { getEditorCommand, openInEditor } from "../../utils/external-editor";
-import { ensureSupportedImageInput } from "../../utils/image-input";
+import { ensureSupportedImageInput } from "../../utils/image-loading";
 import { resizeImage } from "../../utils/image-resize";
 import { generateSessionTitle, setSessionTerminalTitle } from "../../utils/title-generator";
 
@@ -36,13 +37,22 @@ export class InputController {
 					this.ctx.session.isCompacting ||
 					this.ctx.session.isGeneratingHandoff ||
 					this.ctx.session.isBashRunning ||
-					this.ctx.session.isPythonRunning ||
+					this.ctx.session.isEvalRunning ||
 					this.ctx.autoCompactionLoader ||
 					this.ctx.retryLoader ||
 					this.ctx.autoCompactionEscapeHandler ||
 					this.ctx.retryEscapeHandler,
 			);
 		this.ctx.editor.onEscape = () => {
+			if (this.ctx.loopModeEnabled) {
+				this.ctx.pauseLoop();
+				if (this.ctx.session.isStreaming) {
+					void this.ctx.session.abort();
+				} else {
+					this.ctx.cancelPendingSubmission();
+				}
+				return;
+			}
 			if (this.ctx.hasActiveBtw() && this.ctx.handleBtwEscape()) {
 				return;
 			}
@@ -57,8 +67,8 @@ export class InputController {
 				this.ctx.editor.setText("");
 				this.ctx.isBashMode = false;
 				this.ctx.updateEditorBorderColor();
-			} else if (this.ctx.session.isPythonRunning) {
-				this.ctx.session.abortPython();
+			} else if (this.ctx.session.isEvalRunning) {
+				this.ctx.session.abortEval();
 			} else if (this.ctx.isPythonMode) {
 				this.ctx.editor.setText("");
 				this.ctx.isPythonMode = false;
@@ -218,13 +228,16 @@ export class InputController {
 			if (!text) return;
 
 			// Handle built-in slash commands
-			if (
-				await executeBuiltinSlashCommand(text, {
-					ctx: this.ctx,
-					handleBackgroundCommand: () => this.handleBackgroundCommand(),
-				})
-			) {
+			const slashResult = await executeBuiltinSlashCommand(text, {
+				ctx: this.ctx,
+				handleBackgroundCommand: () => this.handleBackgroundCommand(),
+			});
+			if (slashResult === true) {
 				return;
+			}
+			if (typeof slashResult === "string") {
+				// Command handled but returned remaining text to use as prompt
+				text = slashResult;
 			}
 
 			// Handle skill commands (/skill:name [args])
@@ -291,7 +304,7 @@ export class InputController {
 				const isExcluded = text.startsWith("$$");
 				const code = isExcluded ? text.slice(2).trim() : text.slice(1).trim();
 				if (code) {
-					if (this.ctx.session.isPythonRunning) {
+					if (this.ctx.session.isEvalRunning) {
 						this.ctx.showWarning("A Python execution is already running. Press Esc to cancel it first.");
 						this.ctx.editor.setText(text);
 						return;
@@ -302,6 +315,12 @@ export class InputController {
 					this.ctx.updateEditorBorderColor();
 					return;
 				}
+			}
+
+			// While loop mode is on, every user-typed prompt becomes the new loop
+			// prompt that auto-resubmits after each yield.
+			if (this.ctx.loopModeEnabled) {
+				this.ctx.loopPrompt = text;
 			}
 
 			// Queue input during compaction
@@ -321,6 +340,11 @@ export class InputController {
 				this.ctx.editor.setText("");
 				const images = inputImages && inputImages.length > 0 ? [...inputImages] : undefined;
 				this.ctx.pendingImages = [];
+				// Record the signature so the queued message's eventual delivery
+				// (a user-role `message_start` event) leaves any draft the user has
+				// typed since queuing intact. Same protection as #783, applied to
+				// the streaming/queue path.
+				this.ctx.locallySubmittedUserSignatures.add(`${text}\u0000${images?.length ?? 0}`);
 				await this.ctx.session.prompt(text, { streamingBehavior: "steer", images });
 				this.ctx.updatePendingMessagesDisplay();
 				this.ctx.ui.requestRender();
@@ -338,8 +362,14 @@ export class InputController {
 				generateSessionTitle(text, registry, this.ctx.settings, this.ctx.session.sessionId, this.ctx.session.model)
 					.then(async title => {
 						if (title) {
-							await this.ctx.sessionManager.setSessionName(title);
-							setSessionTerminalTitle(title, this.ctx.sessionManager.getCwd());
+							const applied = await this.ctx.sessionManager.setSessionName(title, "auto");
+							if (applied) {
+								setSessionTerminalTitle(
+									this.ctx.sessionManager.getSessionName()!,
+									this.ctx.sessionManager.getCwd(),
+								);
+								this.ctx.updateEditorBorderColor();
+							}
 						}
 					})
 					.catch(() => {});
@@ -423,6 +453,7 @@ export class InputController {
 	}
 
 	restoreQueuedMessagesToEditor(options?: { abort?: boolean; currentText?: string }): number {
+		this.ctx.locallySubmittedUserSignatures.clear();
 		const { steering, followUp } = this.ctx.session.clearQueue();
 		const allQueued = [...steering, ...followUp];
 		if (allQueued.length === 0) {
@@ -553,7 +584,6 @@ export class InputController {
 		return createPromptActionAutocompleteProvider({
 			commands,
 			basePath,
-			searchDb: this.ctx.session.searchDb,
 			keybindings: this.ctx.keybindings,
 			copyCurrentLine: () => this.handleCopyCurrentLine(),
 			copyPrompt: () => this.handleCopyPrompt(),
@@ -705,7 +735,7 @@ export class InputController {
 			return;
 		}
 
-		const currentText = this.ctx.editor.getText();
+		const currentText = this.ctx.editor.getExpandedText?.() ?? this.ctx.editor.getText();
 
 		let ttyHandle: fs.FileHandle | null = null;
 		try {
