@@ -513,6 +513,7 @@ export class TaskTool implements AgentTool<TSchema, TaskToolDetails, Theme> {
 		const mergeMode = this.session.settings.get("task.isolation.merge");
 		const commitStyle = this.session.settings.get("task.isolation.commits");
 		const maxConcurrency = this.session.settings.get("task.maxConcurrency");
+		const subprocessIdleTimeoutMs = this.session.settings.get("task.subprocessTimeoutMs");
 		const taskDepth = this.session.taskDepth ?? 0;
 
 		if (isolationMode === "none" && "isolated" in params) {
@@ -867,6 +868,7 @@ export class TaskTool implements AgentTool<TSchema, TaskToolDetails, Theme> {
 						promptTemplates,
 						localProtocolOptions,
 						parentHindsightSessionState: this.session.getHindsightSessionState?.(),
+						subprocessIdleTimeoutMs,
 					});
 				}
 
@@ -922,6 +924,7 @@ export class TaskTool implements AgentTool<TSchema, TaskToolDetails, Theme> {
 						promptTemplates,
 						localProtocolOptions,
 						parentHindsightSessionState: this.session.getHindsightSessionState?.(),
+						subprocessIdleTimeoutMs,
 					});
 					if (mergeMode === "branch" && result.exitCode === 0) {
 						try {

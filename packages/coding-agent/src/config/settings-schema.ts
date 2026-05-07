@@ -2107,6 +2107,26 @@ export const SETTINGS_SCHEMA = {
 			description: "Encourage the agent to delegate work to subagents unless changes are trivial",
 		},
 	},
+	"task.subprocessTimeoutMs": {
+		type: "number",
+		default: 300_000,
+		ui: {
+			tab: "tasks",
+			label: "Subprocess Idle Timeout",
+			description:
+				"Maximum idle time (ms) for a subagent before auto-abort. " +
+				"Timer resets on each progress event (token, tool call). " +
+				"Set to 0 to disable (not recommended).",
+			options: [
+				{ value: "0", label: "Disabled" },
+				{ value: "60000", label: "1 min" },
+				{ value: "120000", label: "2 min" },
+				{ value: "300000", label: "5 min (default)" },
+				{ value: "600000", label: "10 min" },
+				{ value: "900000", label: "15 min" },
+			],
+		},
+	},
 
 	"task.simple": {
 		type: "enum",

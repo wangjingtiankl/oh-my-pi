@@ -148,6 +148,7 @@ export interface ExecutorOptions {
 	taskDepth?: number;
 	enableLsp?: boolean;
 	signal?: AbortSignal;
+	subprocessIdleTimeoutMs?: number;
 	onProgress?: (progress: AgentProgress) => void;
 	sessionFile?: string | null;
 	persistArtifacts?: boolean;
@@ -513,6 +514,18 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	if (options.artifactsDir) {
 		subtaskSessionFile = path.join(options.artifactsDir, `${id}.jsonl`);
 	}
+	// Emit lifecycle event early so Ctrl+S shows all tasks immediately
+	if (options.eventBus) {
+		options.eventBus.emit(TASK_SUBAGENT_LIFECYCLE_CHANNEL, {
+			id,
+			agent: agent.name,
+			agentSource: agent.source,
+			description: options.description,
+			status: "started",
+			sessionFile: subtaskSessionFile,
+			index,
+		});
+	}
 
 	const settings = options.settings ?? Settings.isolated();
 	const subagentSettings = createSubagentSettings(settings);
@@ -609,22 +622,50 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		signal.addEventListener("abort", onAbort, { once: true, signal: listenerSignal });
 	}
 
-	const resolveSignalAbortReason = (): string => {
-		const reason = signal?.reason;
-		if (reason instanceof Error) {
-			const message = reason.message.trim();
-			if (message.length > 0) return message;
-		} else if (typeof reason === "string") {
-			const message = reason.trim();
-			if (message.length > 0) return message;
+	// Idle watchdog: abort subprocess if no progress for timeout duration
+	const idleTimeoutMsRaw = options.subprocessIdleTimeoutMs ?? 300_000;
+	const idleTimeoutMs = idleTimeoutMsRaw > 0 ? idleTimeoutMsRaw : undefined;
+	let idleTimer: NodeJS.Timeout | undefined;
+	let lastProgressMs = Date.now();
+
+	const resetIdleTimer = () => {
+		lastProgressMs = Date.now();
+		if (idleTimer) clearTimeout(idleTimer);
+		if (idleTimeoutMs === undefined) return;
+		idleTimer = setTimeout(() => {
+			const idleDuration = Date.now() - lastProgressMs;
+			if (idleDuration >= idleTimeoutMs) {
+				requestAbort("terminate");
+			}
+		}, idleTimeoutMs);
+	};
+	resetIdleTimer();
+
+	const resolveAbortReason = (): string | undefined => {
+		if (abortReason === "terminate" && idleTimer !== undefined) {
+			const idleDuration = Date.now() - lastProgressMs;
+			return `Subprocess idle timeout — no progress for ${Math.round(idleDuration / 1000)}s`;
 		}
-		return "Cancelled by caller";
+		if (signal?.aborted) {
+			const reason = signal.reason;
+			if (reason instanceof Error) {
+				const m = reason.message.trim();
+				if (m) return m;
+			}
+			if (typeof reason === "string") {
+				const m = reason.trim();
+				if (m) return m;
+			}
+			return "Cancelled by caller";
+		}
+		return undefined;
 	};
 	const PROGRESS_COALESCE_MS = 150;
 	let lastProgressEmitMs = 0;
 	let progressTimeoutId: NodeJS.Timeout | null = null;
 
 	const emitProgressNow = () => {
+		resetIdleTimer();
 		progress.durationMs = Date.now() - startTime;
 		onProgress?.({ ...progress });
 		if (options.eventBus) {
@@ -919,9 +960,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		let abortReasonText: string | undefined;
 		const checkAbort = () => {
 			if (abortSignal.aborted) {
-				aborted = abortReason === "signal" || abortReason === undefined;
+				aborted = abortReason === "signal" || abortReason === undefined || abortReason === "terminate";
 				if (aborted) {
-					abortReasonText ??= resolveSignalAbortReason();
+					abortReasonText ??= resolveAbortReason();
 				}
 				exitCode = 1;
 				throw new ToolAbortError();
@@ -995,19 +1036,6 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			});
 
 			activeSession = session;
-
-			// Emit lifecycle start event
-			if (options.eventBus) {
-				options.eventBus.emit(TASK_SUBAGENT_LIFECYCLE_CHANNEL, {
-					id,
-					agent: agent.name,
-					agentSource: agent.source,
-					description: options.description,
-					status: "started",
-					sessionFile: subtaskSessionFile,
-					index,
-				});
-			}
 
 			const subagentToolNames = session.getActiveToolNames();
 			const parentOwnedToolNames = new Set(["todo_write"]);
@@ -1133,9 +1161,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			const lastAssistant = session.getLastAssistantMessage();
 			if (lastAssistant) {
 				if (lastAssistant.stopReason === "aborted") {
-					aborted = abortReason === "signal" || abortReason === undefined;
+					aborted = abortReason === "signal" || abortReason === undefined || abortReason === "terminate";
 					if (aborted) {
-						abortReasonText ??= resolveSignalAbortReason();
+						abortReasonText ??= resolveAbortReason();
 					}
 					exitCode = 1;
 				} else if (lastAssistant.stopReason === "error") {
@@ -1150,9 +1178,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			}
 		} finally {
 			if (abortSignal.aborted) {
-				aborted = abortReason === "signal" || abortReason === undefined;
+				aborted = abortReason === "signal" || abortReason === undefined || abortReason === "terminate";
 				if (aborted) {
-					abortReasonText ??= resolveSignalAbortReason();
+					abortReasonText ??= resolveAbortReason();
 				}
 				if (exitCode === 0) exitCode = 1;
 			}
@@ -1188,6 +1216,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	const done = await runSubagent();
 	resolved = true;
 	listenerController.abort();
+	if (idleTimer) clearTimeout(idleTimer);
 
 	if (progressTimeoutId) {
 		clearTimeout(progressTimeoutId);
@@ -1246,7 +1275,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	const finalAbortReason = wasAborted
 		? abortedViaYield
 			? yieldAbortReason
-			: (done.abortReason ?? (signal?.aborted ? resolveSignalAbortReason() : "Subagent aborted task"))
+			: (done.abortReason ?? (signal?.aborted ? resolveAbortReason() : "Subagent aborted task"))
 		: undefined;
 	progress.status = wasAborted ? "aborted" : exitCode === 0 ? "completed" : "failed";
 	scheduleProgress(true);
