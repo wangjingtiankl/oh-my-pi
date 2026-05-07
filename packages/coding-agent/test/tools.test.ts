@@ -15,7 +15,7 @@ import { FindTool } from "@oh-my-pi/pi-coding-agent/tools/find";
 import { JobTool } from "@oh-my-pi/pi-coding-agent/tools/job";
 import { wrapToolWithMetaNotice } from "@oh-my-pi/pi-coding-agent/tools/output-meta";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
-import { SearchTool } from "@oh-my-pi/pi-coding-agent/tools/search";
+import { DEFAULT_MATCH_LIMIT, SearchTool } from "@oh-my-pi/pi-coding-agent/tools/search";
 import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
 import * as markitUtils from "@oh-my-pi/pi-coding-agent/utils/markit";
 import { $which, Snowflake } from "@oh-my-pi/pi-utils";
@@ -29,6 +29,13 @@ function getTextOutput(result: any): string {
 			.map((c: any) => c.text)
 			.join("\n") || ""
 	);
+}
+
+function writeFileWithMtime(filePath: string, content: string, mtimeMs: number): void {
+	fs.mkdirSync(path.dirname(filePath), { recursive: true });
+	fs.writeFileSync(filePath, content);
+	const mtime = new Date(mtimeMs);
+	fs.utimesSync(filePath, mtime, mtime);
 }
 
 function createFifoOrSkip(fifoPath: string): boolean {
@@ -269,7 +276,7 @@ describe("Coding Agent Tools", () => {
 			expect(output).toContain("Line 2");
 			expect(output).toContain("Line 3");
 			// No truncation message since file fits within limits
-			expect(getTextOutput(result)).not.toContain("Use sel=");
+			expect(getTextOutput(result)).not.toContain("Use :");
 			expect(result.details?.truncation).toBeUndefined();
 		});
 
@@ -294,7 +301,7 @@ describe("Coding Agent Tools", () => {
 				content: "# Notebook Title\n\nNotebook body\n",
 			});
 
-			const result = await readTool.execute("test-call-ipynb", { path: notebookPath, sel: "raw" });
+			const result = await readTool.execute("test-call-ipynb", { path: `${notebookPath}:raw` });
 			const output = getTextOutput(result);
 
 			expect(convertSpy).toHaveBeenCalledTimes(1);
@@ -331,7 +338,7 @@ describe("Coding Agent Tools", () => {
 			expect(output).toContain("Line 1");
 			expect(output).toContain(`Line ${defaultLimit}`);
 			expect(output).not.toContain(`Line ${defaultLimit + 1}`);
-			expect(output).toContain(`[Showing lines 1-${defaultLimit} of 3500. Use sel=${defaultLimit + 1} to continue]`);
+			expect(output).toContain(`[Showing lines 1-${defaultLimit} of 3500. Use :${defaultLimit + 1} to continue]`);
 		});
 
 		it("should truncate when byte limit exceeded", async () => {
@@ -345,7 +352,7 @@ describe("Coding Agent Tools", () => {
 
 			expect(output).toContain("Line 1:");
 			// Should show byte limit message
-			expect(output).toMatch(/\[Showing lines 1-\d+ of 1000 \(\d+(\.\d+)?\s*KB limit\)\. Use sel=\d+ to continue\]/);
+			expect(output).toMatch(/\[Showing lines 1-\d+ of 1000 \(\d+(\.\d+)?\s*KB limit\)\. Use :\d+ to continue\]/);
 		});
 
 		it("should handle offset parameter", async () => {
@@ -353,14 +360,14 @@ describe("Coding Agent Tools", () => {
 			const lines = Array.from({ length: 100 }, (_, i) => `Line ${i + 1}`);
 			fs.writeFileSync(testFile, lines.join("\n"));
 
-			const result = await readTool.execute("test-call-5", { path: testFile, sel: "L51" });
+			const result = await readTool.execute("test-call-5", { path: `${testFile}:L51` });
 			const output = getTextOutput(result);
 
 			expect(output).not.toContain("Line 50");
 			expect(output).toContain("Line 51");
 			expect(output).toContain("Line 100");
 			// No truncation message since file fits within limits
-			expect(output).not.toContain("Use sel=");
+			expect(output).not.toContain("Use :");
 		});
 
 		it("should handle limit parameter", async () => {
@@ -368,13 +375,13 @@ describe("Coding Agent Tools", () => {
 			const lines = Array.from({ length: 100 }, (_, i) => `Line ${i + 1}`);
 			fs.writeFileSync(testFile, lines.join("\n"));
 
-			const result = await readTool.execute("test-call-6", { path: testFile, sel: "L1-L10" });
+			const result = await readTool.execute("test-call-6", { path: `${testFile}:L1-L10` });
 			const output = getTextOutput(result);
 
 			expect(output).toContain("Line 1");
 			expect(output).toContain("Line 10");
 			expect(output).not.toContain("Line 11");
-			expect(output).toContain("[Showing lines 1-10 of 100. Use sel=11 to continue]");
+			expect(output).toContain("[Showing lines 1-10 of 100. Use :11 to continue]");
 		});
 
 		it("should handle offset + limit together", async () => {
@@ -383,8 +390,7 @@ describe("Coding Agent Tools", () => {
 			fs.writeFileSync(testFile, lines.join("\n"));
 
 			const result = await readTool.execute("test-call-7", {
-				path: testFile,
-				sel: "L41-L60",
+				path: `${testFile}:L41-L60`,
 			});
 			const output = getTextOutput(result);
 
@@ -392,18 +398,18 @@ describe("Coding Agent Tools", () => {
 			expect(output).toContain("Line 41");
 			expect(output).toContain("Line 60");
 			expect(output).not.toContain("Line 61");
-			expect(output).toContain("[Showing lines 41-60 of 100. Use sel=61 to continue]");
+			expect(output).toContain("[Showing lines 41-60 of 100. Use :61 to continue]");
 		});
 
 		it("should show error when offset is beyond file length", async () => {
 			const testFile = path.join(testDir, "short.txt");
 			fs.writeFileSync(testFile, "Line 1\nLine 2\nLine 3");
 
-			const result = await readTool.execute("test-call-8", { path: testFile, sel: "L100" });
+			const result = await readTool.execute("test-call-8", { path: `${testFile}:L100` });
 			const output = getTextOutput(result);
 
 			expect(output).toContain("Line 100 is beyond end of file (3 lines total)");
-			expect(output).toContain("Use sel=1 to read from the start, or sel=3 to read the last line.");
+			expect(output).toContain("Use :1 to read from the start, or :3 to read the last line.");
 		});
 
 		it("should include truncation details when truncated", async () => {
@@ -420,6 +426,42 @@ describe("Coding Agent Tools", () => {
 			expect(result.details?.truncation?.truncatedBy).toBe("lines");
 			expect(result.details?.truncation?.totalLines).toBe(3500);
 			expect(result.details?.truncation?.outputLines).toBe(defaultLimit);
+		});
+
+		it("should render directories as a two-level tree without capping root entries", async () => {
+			const childDir = path.join(testDir, "child");
+			const base = Date.now() - 60_000;
+			fs.mkdirSync(childDir, { recursive: true });
+			writeFileWithMtime(path.join(testDir, ".hidden-root"), "hidden", base + 20_000);
+			writeFileWithMtime(path.join(testDir, ".DS_Store"), "mac metadata", base + 25_000);
+			writeFileWithMtime(path.join(testDir, "node_modules", "pkg", "index.js"), "ignored", base + 24_000);
+			for (let i = 0; i < 13; i += 1) {
+				const fileName = `root-${String(i).padStart(2, "0")}.txt`;
+				writeFileWithMtime(path.join(testDir, fileName), fileName, base + i);
+			}
+			for (let i = 0; i < 13; i += 1) {
+				const fileName = `child-${String(i).padStart(2, "0")}.txt`;
+				writeFileWithMtime(path.join(childDir, fileName), fileName, base + i);
+			}
+			writeFileWithMtime(path.join(childDir, "nested", "deep.txt"), "deep", base + 30_000);
+
+			const result = await readTool.execute("test-call-directory-tree", { path: testDir });
+			const output = getTextOutput(result);
+
+			expect(result.details?.isDirectory).toBe(true);
+			expect(output).toContain(".");
+			expect(output).toContain(".hidden-root");
+			expect(output).not.toContain(".DS_Store");
+			expect(output).not.toContain("node_modules");
+			expect(output).toContain("root-00.txt");
+			expect(output).toContain("root-01.txt");
+			expect(output).toContain("root-12.txt");
+			expect(output).toContain("child/");
+			expect(output).toContain("nested/");
+			expect(output).toContain("… 2 more");
+			expect(output).not.toContain("child-01.txt");
+			expect(output).toContain("child-00.txt");
+			expect(output).not.toContain("deep.txt");
 		});
 
 		it("should treat .tar archives like directories", async () => {
@@ -493,15 +535,14 @@ describe("Coding Agent Tools", () => {
 				);
 
 				const result = await readTool.execute("test-call-archive-subpath", {
-					path: `${archivePath}:pkg/README.md`,
-					sel: "L1-L2",
+					path: `${archivePath}:pkg/README.md:L1-L2`,
 				});
 				const output = getTextOutput(result);
 
 				expect(output).toContain("# Archive README");
 				expect(output).toContain("Line 2");
 				expect(output).not.toContain("Line 3");
-				expect(output).toContain("Use sel=3");
+				expect(output).toContain("Use :3");
 			});
 		}
 
@@ -1175,7 +1216,7 @@ function b() {
 
 			const result = await searchTool.execute("test-call-11", {
 				pattern: "match",
-				path: testFile,
+				paths: [testFile],
 			});
 
 			const output = getTextOutput(result);
@@ -1184,14 +1225,14 @@ function b() {
 			expect(output).toMatch(/\*2\|match line/);
 		});
 
-		it("should accept wildcard patterns in the path parameter", async () => {
+		it("should accept wildcard patterns in paths", async () => {
 			fs.writeFileSync(path.join(testDir, "schema-review-alpha.test.ts"), "review target\n");
 			fs.writeFileSync(path.join(testDir, "schema-review-beta.test.ts"), "review target\n");
 			fs.writeFileSync(path.join(testDir, "schema-other.test.ts"), "review target\n");
 
 			const result = await searchTool.execute("test-call-11-path-glob", {
 				pattern: "review target",
-				path: `${testDir}/schema-review-*.test.ts`,
+				paths: [`${testDir}/schema-review-*.test.ts`],
 			});
 
 			const output = getTextOutput(result);
@@ -1200,7 +1241,7 @@ function b() {
 			expect(output).not.toContain("schema-other.test.ts");
 			expect(result.details?.fileCount).toBe(2);
 		});
-		it("should accept nested wildcard filters in the path parameter", async () => {
+		it("should accept nested wildcard filters in paths", async () => {
 			const packageDir = path.join(testDir, "node_modules", ".bun");
 			const aiDir = path.join(packageDir, "ai@6.0.119+build123", "node_modules", "ai");
 			const nestedDir = path.join(aiDir, "nested");
@@ -1212,7 +1253,7 @@ function b() {
 
 			const result = await searchTool.execute("test-call-11-path-and-glob", {
 				pattern: "providerOptions",
-				path: `${packageDir}/ai@6.0.119+*/node_modules/ai/**/*.{d.ts,ts}`,
+				paths: [`${packageDir}/ai@6.0.119+*/node_modules/ai/**/*.{d.ts,ts}`],
 				gitignore: false,
 			});
 
@@ -1235,7 +1276,7 @@ function b() {
 			);
 			const result = await contextSearchTool.execute("test-call-12", {
 				pattern: "match",
-				path: testFile,
+				paths: [testFile],
 			});
 
 			const output = getTextOutput(result);
@@ -1252,7 +1293,7 @@ function b() {
 
 			const result = await searchTool.execute("test-call-12-skip", {
 				pattern: "needle",
-				path: testFile,
+				paths: [testFile],
 				skip: 1,
 			});
 
@@ -1270,7 +1311,7 @@ function b() {
 
 			const result = await searchTool.execute("test-call-13-round-robin", {
 				pattern: "needle",
-				path: testDir,
+				paths: [testDir],
 			});
 
 			const output = getTextOutput(result);
@@ -1290,7 +1331,7 @@ function b() {
 
 			const result = await searchTool.execute("test-call-14-grouped-headings", {
 				pattern: "needle",
-				path: testDir,
+				paths: [testDir],
 			});
 
 			const output = getTextOutput(result);
@@ -1314,7 +1355,7 @@ function b() {
 
 			const result = await searchTool.execute("test-call-15-directory-headings", {
 				pattern: "Claude Opus",
-				path: testDir,
+				paths: [testDir],
 			});
 
 			const output = getTextOutput(result);
@@ -1333,7 +1374,7 @@ function b() {
 
 			const result = await searchTool.execute("test-call-15-gitignore-default", {
 				pattern: "needle",
-				path: scenarioDir,
+				paths: [scenarioDir],
 			});
 
 			const output = getTextOutput(result);
@@ -1351,7 +1392,7 @@ function b() {
 
 			const result = await searchTool.execute("test-call-16-gitignore-off", {
 				pattern: "needle",
-				path: scenarioDir,
+				paths: [scenarioDir],
 				gitignore: false,
 			});
 
@@ -1373,7 +1414,7 @@ function b() {
 
 			const result = await searchTool.execute("test-call-16-fifo-dir", {
 				pattern: "needle",
-				path: scenarioDir,
+				paths: [scenarioDir],
 				gitignore: false,
 			});
 
@@ -1386,18 +1427,18 @@ function b() {
 			expect(result.details?.matchCount).toBe(1);
 		});
 		it("should apply the fixed default match cap", async () => {
-			const lines = Array.from({ length: 60 }, (_, i) => `needle ${i + 1}`);
+			const lines = Array.from({ length: DEFAULT_MATCH_LIMIT + 100 }, (_, i) => `needle ${i + 1}`);
 			fs.writeFileSync(path.join(testDir, "default-limit.txt"), lines.join("\n"));
 
 			const result = await searchTool.execute("test-call-14-default-limit", {
 				pattern: "needle",
-				path: testDir,
+				paths: [testDir],
 			});
 
 			const output = getTextOutput(result);
-			expect(output).toContain("Result limit reached; narrow path or use skip=20.");
-			expect(result.details?.matchCount).toBe(20);
-			expect(result.details?.matchLimitReached).toBe(20);
+			expect(output).toContain(`Result limit reached; narrow paths or use skip=${DEFAULT_MATCH_LIMIT}.`);
+			expect(result.details?.matchCount).toBe(DEFAULT_MATCH_LIMIT);
+			expect(result.details?.matchLimitReached).toBe(DEFAULT_MATCH_LIMIT);
 		});
 	});
 
@@ -1407,7 +1448,7 @@ function b() {
 			fs.writeFileSync(testFile, "single");
 
 			const result = await findTool.execute("test-call-13a", {
-				pattern: testFile,
+				paths: [testFile],
 			});
 
 			const outputLines = getTextOutput(result)
@@ -1425,7 +1466,7 @@ function b() {
 			fs.writeFileSync(path.join(testDir, "visible.txt"), "visible");
 
 			const result = await findTool.execute("test-call-13", {
-				pattern: `${testDir}/**/*.txt`,
+				paths: [`${testDir}/**/*.txt`],
 				hidden: true,
 			});
 
@@ -1445,7 +1486,7 @@ function b() {
 			fs.writeFileSync(path.join(testDir, "kept.txt"), "kept");
 
 			const result = await findTool.execute("test-call-14", {
-				pattern: `${testDir}/**/*.txt`,
+				paths: [`${testDir}/**/*.txt`],
 			});
 
 			const output = getTextOutput(result);
@@ -1470,7 +1511,7 @@ function b() {
 			fs.utimesSync(newerFile, newerTime, newerTime);
 
 			const result = await findTool.execute("test-call-14b", {
-				pattern: `${testDir}/**/auth-actions.spec.ts`,
+				paths: [`${testDir}/**/auth-actions.spec.ts`],
 			});
 
 			const outputLines = getTextOutput(result)
@@ -1487,7 +1528,7 @@ function b() {
 			fs.writeFileSync(path.join(nestedDir, "daemon-telemetry.ts"), "telemetry\n");
 
 			const result = await findTool.execute("test-call-14c", {
-				pattern: "apps/daemon/src/**/daemon-telemetry.ts",
+				paths: ["apps/daemon/src/**/daemon-telemetry.ts"],
 			});
 
 			const outputLines = getTextOutput(result)
@@ -1507,7 +1548,7 @@ function b() {
 			fs.writeFileSync(path.join(clientDir, "client.ts"), "client\n");
 
 			const result = await findTool.execute("test-call-14e", {
-				pattern: "apps/daemon/src/**/*.ts,apps/client/src/**/*.ts",
+				paths: ["apps/daemon/src/**/*.ts", "apps/client/src/**/*.ts"],
 			});
 
 			const outputLines = getTextOutput(result)
@@ -1528,7 +1569,7 @@ function b() {
 
 			const startedAt = performance.now();
 			const result = await findTool.execute("test-call-14d", {
-				pattern: "**/.env*",
+				paths: ["**/.env*"],
 			});
 			const elapsedMs = performance.now() - startedAt;
 

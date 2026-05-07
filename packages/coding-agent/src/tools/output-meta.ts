@@ -337,7 +337,7 @@ export function formatTruncationMetaNotice(truncation: TruncationMeta): string {
 	}
 
 	if (truncation.nextOffset != null) {
-		notice += `. Use sel=${truncation.nextOffset} to continue`;
+		notice += `. Use :${truncation.nextOffset} to continue`;
 	}
 
 	if (truncation.artifactId != null) {
@@ -465,6 +465,7 @@ async function spillLargeResultToArtifact(
 ): Promise<AgentToolResult> {
 	const sessionManager = context?.sessionManager;
 	if (!sessionManager) return result;
+	if (toolName === "read") return result;
 	const { threshold, tailBytes, tailLines } = getSpillConfig(context?.settings);
 
 	// Skip if tool already saved an artifact

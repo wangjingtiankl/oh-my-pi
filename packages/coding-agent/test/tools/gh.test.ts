@@ -187,6 +187,91 @@ describe("github tool", () => {
 		expect(text).toContain("Topics: cli, github");
 	});
 
+	it("creates a pull request via gh and renders the resulting summary", async () => {
+		const textCalls: string[][] = [];
+		const textSpy = vi.spyOn(git.github, "text").mockImplementation(async (_cwd, args) => {
+			textCalls.push([...args]);
+			return "https://github.com/owner/repo/pull/77\n";
+		});
+		const jsonCalls: string[][] = [];
+		const jsonSpy = vi.spyOn(git.github, "json").mockImplementation(async (_cwd, args) => {
+			jsonCalls.push([...args]);
+			return {
+				number: 77,
+				title: "Add gizmo",
+				state: "OPEN",
+				isDraft: true,
+				baseRefName: "main",
+				headRefName: "feature/gizmo",
+				author: { login: "octocat" },
+				createdAt: "2026-05-01T09:00:00Z",
+				labels: [{ name: "enhancement" }],
+				body: "Adds a gizmo.",
+				url: "https://github.com/owner/repo/pull/77",
+			} as never;
+		});
+
+		const tool = new GithubTool(createSession());
+		const result = await tool.execute("pr-create", {
+			op: "pr_create",
+			repo: "owner/repo",
+			title: "Add gizmo",
+			body: "Adds a gizmo.",
+			base: "main",
+			head: "feature/gizmo",
+			draft: true,
+			reviewer: ["reviewer1"],
+			label: ["enhancement"],
+		});
+		const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+
+		// gh pr create invocation: must pass --repo, --title, --base, --head,
+		// --draft, --reviewer, --label, and route the body through --body-file
+		// (not --body, to keep multi-KB bodies clear of argv-length limits).
+		expect(textSpy).toHaveBeenCalledTimes(1);
+		const createArgs = textCalls[0];
+		expect(createArgs.slice(0, 2)).toEqual(["pr", "create"]);
+		expect(createArgs).toEqual(expect.arrayContaining(["--repo", "owner/repo"]));
+		expect(createArgs).toEqual(expect.arrayContaining(["--title", "Add gizmo"]));
+		expect(createArgs).toEqual(expect.arrayContaining(["--base", "main"]));
+		expect(createArgs).toEqual(expect.arrayContaining(["--head", "feature/gizmo"]));
+		expect(createArgs).toContain("--draft");
+		expect(createArgs).toEqual(expect.arrayContaining(["--reviewer", "reviewer1"]));
+		expect(createArgs).toEqual(expect.arrayContaining(["--label", "enhancement"]));
+		const bodyFlagIndex = createArgs.indexOf("--body-file");
+		expect(bodyFlagIndex).toBeGreaterThanOrEqual(0);
+		const bodyFilePath = createArgs[bodyFlagIndex + 1];
+		expect(bodyFilePath).toMatch(/gh-pr-body-/);
+		expect(createArgs).not.toContain("--body");
+
+		// Follow-up summary fetch must target the parsed PR number/repo.
+		expect(jsonSpy).toHaveBeenCalledTimes(1);
+		const viewArgs = jsonCalls[0];
+		expect(viewArgs.slice(0, 3)).toEqual(["pr", "view", "77"]);
+		expect(viewArgs).toEqual(expect.arrayContaining(["--repo", "owner/repo"]));
+
+		// Output: PR number + summary rendered, URL surfaces, body block included.
+		expect(text).toContain("# Created Pull Request #77: Add gizmo");
+		expect(text).toContain("URL: https://github.com/owner/repo/pull/77");
+		expect(text).toContain("Draft: true");
+		expect(text).toContain("Base: main");
+		expect(text).toContain("Head: feature/gizmo");
+		expect(text).toContain("Labels: enhancement");
+		expect(text).toContain("Adds a gizmo.");
+	});
+
+	it("rejects pr_create when neither title nor fill is supplied", async () => {
+		const textSpy = vi.spyOn(git.github, "text");
+		const jsonSpy = vi.spyOn(git.github, "json");
+		const tool = new GithubTool(createSession());
+
+		await expect(tool.execute("pr-create", { op: "pr_create", repo: "owner/repo" })).rejects.toThrow(
+			"title is required unless fill is true",
+		);
+		expect(textSpy).not.toHaveBeenCalled();
+		expect(jsonSpy).not.toHaveBeenCalled();
+	});
+
 	it("formats issue comments and omits minimized ones", async () => {
 		vi.spyOn(git.github, "json").mockResolvedValue({
 			number: 42,
@@ -371,6 +456,105 @@ describe("github tool", () => {
 		expect(prArgs?.at(2)).toBe("--limit");
 		expect(prArgs?.at(-2)).toBe("--");
 		expect(prArgs?.at(-1)).toBe("-label:bug");
+	});
+
+	it("formats code search results with paths, repo, sha, and match fragment", async () => {
+		vi.spyOn(git.github, "json").mockResolvedValue([
+			{
+				path: "src/lib.ts",
+				repository: { nameWithOwner: "owner/repo" },
+				sha: "abcdef1234567890",
+				url: "https://github.com/owner/repo/blob/abcdef1234567890/src/lib.ts",
+				textMatches: [{ fragment: "function findThing(): void {\n  ...\n}", property: "content" }],
+			},
+		]);
+
+		const tool = new GithubTool(createSession());
+		const result = await tool.execute("search-code", {
+			op: "search_code",
+			query: "findThing",
+			repo: "owner/repo",
+			limit: 1,
+		});
+		const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+
+		expect(text).toContain("# GitHub code search");
+		expect(text).toContain("Query: findThing");
+		expect(text).toContain("Repository: owner/repo");
+		expect(text).toContain("- src/lib.ts");
+		expect(text).toContain("  Repo: owner/repo");
+		expect(text).toContain("  Commit: abcdef123456");
+		expect(text).toContain("  Match: function findThing(): void {");
+	});
+
+	it("formats commit search results with short sha and message subject", async () => {
+		vi.spyOn(git.github, "json").mockResolvedValue([
+			{
+				sha: "0123456789abcdef",
+				author: { login: "octocat" },
+				commit: {
+					message: "Fix flaky test\n\nMore detail in the body.",
+					author: { name: "Mona Lisa", email: "mona@example.com", date: "2026-04-01T12:00:00Z" },
+				},
+				repository: { nameWithOwner: "owner/repo" },
+				url: "https://github.com/owner/repo/commit/0123456789abcdef",
+			},
+		]);
+
+		const tool = new GithubTool(createSession());
+		const result = await tool.execute("search-commits", {
+			op: "search_commits",
+			query: "fix flaky",
+			repo: "owner/repo",
+			limit: 1,
+		});
+		const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+
+		expect(text).toContain("# GitHub commits search");
+		expect(text).toContain("- 0123456789ab Fix flaky test");
+		expect(text).not.toContain("More detail in the body.");
+		expect(text).toContain("  Author: @octocat");
+		expect(text).toContain("  Date: 2026-04-01T12:00:00Z");
+	});
+
+	it("formats repository search results without forwarding --repo", async () => {
+		const runGhJsonSpy = vi.spyOn(git.github, "json").mockResolvedValue([
+			{
+				fullName: "octocat/hello-world",
+				description: "First line.\nSecond line should not surface.",
+				language: "TypeScript",
+				stargazersCount: 42,
+				forksCount: 7,
+				openIssuesCount: 3,
+				visibility: "public",
+				isArchived: false,
+				isFork: false,
+				updatedAt: "2026-04-01T09:00:00Z",
+				url: "https://github.com/octocat/hello-world",
+			},
+		]);
+
+		const tool = new GithubTool(createSession());
+		const result = await tool.execute("search-repos", {
+			op: "search_repos",
+			query: "language:typescript stars:>100",
+			repo: "ignored/value",
+			limit: 1,
+		});
+		const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+
+		expect(text).toContain("# GitHub repositories search");
+		expect(text).toContain("- octocat/hello-world");
+		expect(text).toContain("  Description: First line.");
+		expect(text).not.toContain("Second line should not surface.");
+		expect(text).toContain("  Language: TypeScript");
+		expect(text).toContain("  Stars: 42");
+
+		const reposArgs = runGhJsonSpy.mock.calls[0]?.[1];
+		expect(reposArgs?.slice(0, 2)).toEqual(["search", "repos"]);
+		expect(reposArgs).not.toContain("--repo");
+		expect(reposArgs?.at(-2)).toBe("--");
+		expect(reposArgs?.at(-1)).toBe("language:typescript stars:>100");
 	});
 
 	it("returns diff output under a stable heading without rewriting patch content", async () => {

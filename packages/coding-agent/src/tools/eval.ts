@@ -26,7 +26,7 @@ export const EVAL_DEFAULT_PREVIEW_LINES = 10;
 
 export const evalSchema = Type.Object({
 	input: Type.String({
-		description: "atom-style eval input containing CELL sections, fenced code, and optional RESET directive",
+		description: "eval input as a sequence of `===== <info> =====` cell headers followed by code",
 	}),
 });
 export type EvalToolParams = Static<typeof evalSchema>;
@@ -207,6 +207,8 @@ async function resolveBackend(
 
 export class EvalTool implements AgentTool<typeof evalSchema> {
 	readonly name = "eval";
+	readonly summary = "Execute Python or JavaScript code in an in-process eval backend";
+	readonly loadMode = "discoverable";
 	readonly label = "Eval";
 	get description(): string {
 		if (!this.session) return getEvalToolDescription();
@@ -250,7 +252,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 		let previousRuntimeLanguage: EvalLanguage | undefined;
 		const cells: ResolvedEvalCell[] = [];
 		for (const cell of parsedInput.cells) {
-			const requested = cell.languageOrigin === "fence" ? cell.language : (previousRuntimeLanguage ?? undefined);
+			const requested = cell.languageOrigin === "header" ? cell.language : (previousRuntimeLanguage ?? undefined);
 			const resolved = await resolveBackend(session, requested, cell.code);
 			previousRuntimeLanguage = resolved.backend.id;
 			cells.push({
@@ -600,12 +602,6 @@ function formatStatusEvent(event: EvalStatusEvent, theme: Theme): string {
 		pwd: "icon.folder",
 		mkdir: "icon.folder",
 		tree: "icon.folder",
-		stat: "icon.folder",
-		find: "icon.file",
-		grep: "icon.file",
-		rgrep: "icon.file",
-		glob: "icon.file",
-		sed: "icon.file",
 		git_status: "icon.git",
 		git_diff: "icon.git",
 		git_log: "icon.git",
@@ -642,19 +638,6 @@ function formatStatusEvent(event: EvalStatusEvent, theme: Theme): string {
 			parts.push(`${data.files} file${(data.files as number) !== 1 ? "s" : ""}`);
 			parts.push(`${data.chars} chars`);
 			break;
-		case "find":
-		case "glob":
-			parts.push(`${data.count} match${(data.count as number) !== 1 ? "es" : ""}`);
-			if (data.pattern) parts.push(`for "${truncateToWidth(String(data.pattern), 20)}"`);
-			break;
-		case "grep":
-			parts.push(`${data.count} match${(data.count as number) !== 1 ? "es" : ""}`);
-			if (data.path) parts.push(`in ${shortenPath(String(data.path))}`);
-			break;
-		case "rgrep":
-			parts.push(`${data.count} match${(data.count as number) !== 1 ? "es" : ""}`);
-			if (data.pattern) parts.push(`for "${truncateToWidth(String(data.pattern), 20)}"`);
-			break;
 		case "ls":
 			parts.push(`${data.count} entr${(data.count as number) !== 1 ? "ies" : "y"}`);
 			break;
@@ -666,18 +649,6 @@ function formatStatusEvent(event: EvalStatusEvent, theme: Theme): string {
 			} else {
 				parts.push(`${data.count} variable${(data.count as number) !== 1 ? "s" : ""}`);
 			}
-			break;
-		case "stat":
-			if (data.is_dir) {
-				parts.push("directory");
-			} else {
-				parts.push(`${data.size} bytes`);
-			}
-			if (data.path) parts.push(shortenPath(String(data.path)));
-			break;
-		case "sed":
-			parts.push(`${data.count} replacement${(data.count as number) !== 1 ? "s" : ""}`);
-			if (data.path) parts.push(`in ${shortenPath(String(data.path))}`);
 			break;
 		case "git_status":
 			if (data.clean) {
@@ -759,28 +730,8 @@ function formatStatusEventExpanded(event: EvalStatusEvent, theme: Theme): string
 	};
 
 	switch (op) {
-		case "find":
-		case "glob":
-			if (data.matches) addItems(data.matches as unknown[], m => String(m));
-			break;
 		case "ls":
 			if (data.items) addItems(data.items as unknown[], m => String(m));
-			break;
-		case "grep":
-			if (data.hits) {
-				addItems(data.hits as unknown[], h => {
-					const hit = h as { line: number; text: string };
-					return `${hit.line}: ${truncateToWidth(hit.text, 60)}`;
-				});
-			}
-			break;
-		case "rgrep":
-			if (data.hits) {
-				addItems(data.hits as unknown[], h => {
-					const hit = h as { file: string; line: number; text: string };
-					return `${shortenPath(hit.file)}:${hit.line}: ${truncateToWidth(hit.text, 50)}`;
-				});
-			}
 			break;
 		case "env":
 			if (data.keys) addItems(data.keys as unknown[], k => String(k), 10);

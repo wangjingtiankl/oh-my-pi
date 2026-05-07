@@ -195,7 +195,9 @@ function validateTaskModeParams(simpleMode: TaskSimpleMode, params: TaskParams):
 export class TaskTool implements AgentTool<TSchema, TaskToolDetails, Theme> {
 	readonly name = "task";
 	readonly label = "Task";
+	readonly summary = "Spawn a subagent to complete a parallel task";
 	readonly strict = true;
+	readonly loadMode = "discoverable";
 	readonly renderResult = renderResult;
 	readonly #discoveredAgents: AgentDefinition[];
 	readonly #blockedAgent: string | undefined;
@@ -864,6 +866,7 @@ export class TaskTool implements AgentTool<TSchema, TaskToolDetails, Theme> {
 						skills: availableSkills,
 						promptTemplates,
 						localProtocolOptions,
+						parentHindsightSessionState: this.session.getHindsightSessionState?.(),
 					});
 				}
 
@@ -918,6 +921,7 @@ export class TaskTool implements AgentTool<TSchema, TaskToolDetails, Theme> {
 						skills: availableSkills,
 						promptTemplates,
 						localProtocolOptions,
+						parentHindsightSessionState: this.session.getHindsightSessionState?.(),
 					});
 					if (mergeMode === "branch" && result.exitCode === 0) {
 						try {

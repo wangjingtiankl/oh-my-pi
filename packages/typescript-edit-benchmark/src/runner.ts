@@ -33,7 +33,7 @@ function formatLogPath(logFile: string): string {
 /** Subset of session state used for markdown conversation dumps (parity with /dump). */
 type ConversationDumpSessionState = {
 	sessionFile?: string;
-	systemPrompt?: string;
+	systemPrompt?: string[];
 	model?: Model;
 	thinkingLevel?: ThinkingLevel | undefined;
 	dumpTools?: Array<{ name: string; description: string; parameters: unknown }>;
@@ -99,7 +99,7 @@ export interface BenchmarkConfig {
 type ConversationDumpSnapshot = {
 	messages: AgentMessage[];
 	sourceSessionFile?: string;
-	systemPrompt?: string;
+	systemPrompt?: string[];
 	model?: Model;
 	thinkingLevel?: ThinkingLevel | undefined;
 	dumpTools?: Array<{ name: string; description: string; parameters: unknown }>;
@@ -225,7 +225,11 @@ export type EditFailureCategory = (typeof EDIT_FAILURE_CATEGORIES)[number];
 function categorizeEditFailure(error: string, args: unknown): EditFailureCategory {
 	const payload = getEditPayloadFromArgs(args);
 	const hasRangeReplacePayload = /^[1-9]\d*[a-z]{2}\.\.[1-9]\d*[a-z]{2}[ \t]*=/m.test(payload);
-	if (/\\TEXT continuation|range[- ]replacement continuation|LidA\.\.LidB=FIRST_LINE/i.test(error)) {
+	if (
+		/\\TEXT.* (?:continuation|has been removed)|range[- ]replacement continuation|LidA\.\.LidB=FIRST_LINE/i.test(
+			error,
+		)
+	) {
 		return "range-continuation";
 	}
 	if (/unified-diff syntax|\+Lid[=|]|\+[1-9]\d*[a-z]{2}[=|]/i.test(error)) {
@@ -260,7 +264,7 @@ function countEditFailureCategories(runs: TaskRunResult[]): Record<EditFailureCa
 	return counts;
 }
 
-const HASHLINE_SUBTYPES = ["set", "set_range", "insert"] as const;
+const HL_SUBTYPES = ["set", "set_range", "insert"] as const;
 const BENCHMARK_TOOL_NAMES = ["read", "edit", "write", "apply_patch"] as const;
 const EDIT_TOOL_NAMES = ["edit", "apply_patch"] as const;
 
@@ -273,13 +277,13 @@ function isMutationTool(toolName: unknown): boolean {
 }
 
 function countHashlineEditSubtypes(args: unknown): Record<string, number> {
-	const counts: Record<string, number> = Object.fromEntries(HASHLINE_SUBTYPES.map(k => [k, 0]));
+	const counts: Record<string, number> = Object.fromEntries(HL_SUBTYPES.map(k => [k, 0]));
 	if (!args || typeof args !== "object") return counts;
 	const edits = (args as { edits?: unknown[] }).edits;
 	if (!Array.isArray(edits)) return counts;
 	for (const edit of edits) {
 		if (!edit || typeof edit !== "object") continue;
-		for (const key of HASHLINE_SUBTYPES) {
+		for (const key of HL_SUBTYPES) {
 			if (key in edit) {
 				counts[key]++;
 				break;
@@ -980,7 +984,7 @@ async function runSingleTask(
 		editAutocorrects: 0,
 		totalInputChars: 0,
 	};
-	const hashlineSubtypes: Record<string, number> = Object.fromEntries(HASHLINE_SUBTYPES.map(k => [k, 0]));
+	const hashlineSubtypes: Record<string, number> = Object.fromEntries(HL_SUBTYPES.map(k => [k, 0]));
 
 	const logFile = path.join(TMP, `run-${task.id}-${runIndex}.jsonl`);
 	const logEvent = async (event: unknown) => {
@@ -1010,7 +1014,6 @@ async function runSingleTask(
 		if (config.editFuzzyThreshold !== undefined)
 			process.env.PI_EDIT_FUZZY_THRESHOLD =
 				config.editFuzzyThreshold === "auto" ? "auto" : String(config.editFuzzyThreshold);
-		process.env.PI_STRICT_EDIT_MODE = "1";
 		process.env.PI_NO_TITLE = "1";
 
 		const useInProcess = config.inProcess !== false;
@@ -1047,7 +1050,7 @@ async function runSingleTask(
 			}
 
 			const initialState = await client.getState();
-			const systemPromptTokens = estimateTokens(initialState.systemPrompt ?? "");
+			const systemPromptTokens = estimateTokens(initialState.systemPrompt?.join("\n\n") ?? "");
 
 			const maxAttempts = Math.max(1, Math.floor(config.maxAttempts ?? 1));
 			const maxTimeoutRetries = config.maxTimeoutRetries ?? 3;
@@ -1199,7 +1202,7 @@ async function runSingleTask(
 							pendingEdits.delete(e.toolCallId);
 							if (config.editVariant === "hashline" && args) {
 								const counts = countHashlineEditSubtypes(args);
-								for (const key of HASHLINE_SUBTYPES) {
+								for (const key of HL_SUBTYPES) {
 									hashlineSubtypes[key] += counts[key];
 								}
 							}
@@ -1381,7 +1384,7 @@ async function _runRpcBenchmarkRun(
 		editAutocorrects: 0,
 		totalInputChars: 0,
 	};
-	const hashlineSubtypes: Record<string, number> = Object.fromEntries(HASHLINE_SUBTYPES.map(k => [k, 0]));
+	const hashlineSubtypes: Record<string, number> = Object.fromEntries(HL_SUBTYPES.map(k => [k, 0]));
 
 	const logFile = path.join(sessionDir, `run-${task.id}-${runIndex}.jsonl`);
 	const logEvent = async (event: unknown) => {
@@ -1525,7 +1528,7 @@ async function _runRpcBenchmarkRun(
 						pendingEdits.delete(e.toolCallId);
 						if (config.editVariant === "hashline" && args) {
 							const counts = countHashlineEditSubtypes(args);
-							for (const key of HASHLINE_SUBTYPES) {
+							for (const key of HL_SUBTYPES) {
 								hashlineSubtypes[key] += counts[key];
 							}
 						}
@@ -2173,10 +2176,7 @@ export function buildBenchmarkResult(params: {
 	const hashlineEditSubtypes: Record<string, number> | undefined =
 		params.config.editVariant === "hashline"
 			? Object.fromEntries(
-					HASHLINE_SUBTYPES.map(key => [
-						key,
-						allRuns.reduce((sum, r) => sum + (r.hashlineEditSubtypes?.[key] ?? 0), 0),
-					]),
+					HL_SUBTYPES.map(key => [key, allRuns.reduce((sum, r) => sum + (r.hashlineEditSubtypes?.[key] ?? 0), 0)]),
 				)
 			: undefined;
 

@@ -1,6 +1,33 @@
 # Changelog
 
 ## [Unreleased]
+
+## [14.7.2] - 2026-05-06
+### Added
+
+- Added `loadMode` option to `AgentTool` to mark built-in tools as `essential` for initial loading or `discoverable` for search activation
+- Added optional `summary` field to `AgentTool` definitions for one-line text used in tool discovery indexes
+
+## [14.7.0] - 2026-05-04
+### Breaking Changes
+
+- Changed `Agent` API types so `systemPrompt` is now a list of prompt strings, requiring callers to pass and update system prompts via string arrays
+
+### Changed
+
+- Removed automatic project-context injection into each model call from loop logic
+
+### Removed
+
+- Removed the `projectPrompt` field from agent state/context and the `setProjectPrompt` mutator
+
+## [14.6.2] - 2026-05-03
+
+### Fixed
+
+- Fixed unhandled promise rejection when `getApiKey` or any other async error occurs during `streamAssistantResponse`: agent loop IIFEs now catch and route errors through `EventStream.fail()`, which terminates the `for await` loop and lets `Agent#runLoop`'s catch block create a proper error assistant message instead of crashing
+
+## [14.6.0] - 2026-05-02
 ### Fixed
 
 - Fixed request cancellation before provider events by emitting an aborted assistant message and ending the stream with `stopReason: "aborted"`

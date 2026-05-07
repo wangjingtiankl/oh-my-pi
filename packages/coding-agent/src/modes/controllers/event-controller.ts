@@ -53,6 +53,7 @@ export class EventController {
 			todo_reminder: e => this.#handleTodoReminder(e),
 			todo_auto_clear: e => this.#handleTodoAutoClear(e),
 			irc_message: e => this.#handleIrcMessage(e),
+			notice: e => this.#handleNotice(e),
 		} satisfies AgentSessionEventHandlers;
 	}
 
@@ -110,8 +111,11 @@ export class EventController {
 		assistantComponent.setToolResultImages(toolCallId, images);
 		return true;
 	}
-	#updateWorkingMessageFromIntent(intent: string | undefined): void {
-		const trimmed = intent?.trim();
+	#updateWorkingMessageFromIntent(intent: unknown): void {
+		// Streamed JSON can deliver non-string `_i` (object, number, boolean) before
+		// schema validation; `?.` only guards null/undefined, so guard the type too.
+		if (typeof intent !== "string") return;
+		const trimmed = intent.trim();
 		if (!trimmed || trimmed === this.#lastIntent) return;
 		this.#lastIntent = trimmed;
 		this.ctx.setWorkingMessage(`${trimmed} (esc to interrupt)`);
@@ -220,6 +224,17 @@ export class EventController {
 		this.ctx.ui.requestRender();
 	}
 
+	async #handleNotice(event: Extract<AgentSessionEvent, { type: "notice" }>): Promise<void> {
+		const message = event.source ? `${event.source}: ${event.message}` : event.message;
+		if (event.level === "error") {
+			this.ctx.showError(message);
+		} else if (event.level === "warning") {
+			this.ctx.showWarning(message);
+		} else {
+			this.ctx.showStatus(message);
+		}
+	}
+
 	async #handleMessageUpdate(event: Extract<AgentSessionEvent, { type: "message_update" }>): Promise<void> {
 		if (this.ctx.streamingComponent && event.message.role === "assistant") {
 			this.ctx.streamingMessage = event.message;
@@ -265,6 +280,7 @@ export class EventController {
 							showImages: settings.get("terminal.showImages"),
 							editFuzzyThreshold: settings.get("edit.fuzzyThreshold"),
 							editAllowFuzzy: settings.get("edit.fuzzyMatch"),
+							hashlineAutoDropPureInsertDuplicates: settings.get("edit.hashlineAutoDropPureInsertDuplicates"),
 						},
 						tool,
 						this.ctx.ui,
@@ -288,7 +304,7 @@ export class EventController {
 				const args = content.arguments;
 				if (!args || typeof args !== "object") continue;
 				if (INTENT_FIELD in args) {
-					this.#updateWorkingMessageFromIntent(args[INTENT_FIELD] as string | undefined);
+					this.#updateWorkingMessageFromIntent(args[INTENT_FIELD]);
 					continue;
 				}
 				const tool = this.ctx.session.getToolByName(content.name);
@@ -368,6 +384,7 @@ export class EventController {
 					showImages: settings.get("terminal.showImages"),
 					editFuzzyThreshold: settings.get("edit.fuzzyThreshold"),
 					editAllowFuzzy: settings.get("edit.fuzzyMatch"),
+					hashlineAutoDropPureInsertDuplicates: settings.get("edit.hashlineAutoDropPureInsertDuplicates"),
 				},
 				tool,
 				this.ctx.ui,

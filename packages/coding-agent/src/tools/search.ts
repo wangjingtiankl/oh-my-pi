@@ -22,7 +22,8 @@ import {
 	hasGlobPathChars,
 	normalizePathLikeInput,
 	parseSearchPath,
-	resolveMultiSearchPath,
+	partitionExistingPaths,
+	resolveExplicitSearchPaths,
 	resolveToCwd,
 } from "./path-utils";
 import {
@@ -37,9 +38,10 @@ import { toolResult } from "./tool-result";
 
 const searchSchema = Type.Object({
 	pattern: Type.String({ description: "regex pattern", examples: ["function\\s+\\w+", "TODO"] }),
-	path: Type.String({
-		description: "file, directory, glob, comma-separated paths, or internal URL to search",
-		examples: ["src/", "src/foo.ts", "src/**/*.ts"],
+	paths: Type.Array(Type.String({ description: "file, directory, glob, or internal URL to search" }), {
+		minItems: 1,
+		description: "files, directories, globs, or internal URLs to search",
+		examples: [["src/"], ["src/foo.ts"], ["src/**/*.ts"], ["src/", "packages/"]],
 	}),
 	i: Type.Optional(Type.Boolean({ description: "case-insensitive search", default: false })),
 	gitignore: Type.Optional(Type.Boolean({ description: "respect gitignore", default: true })),
@@ -48,7 +50,7 @@ const searchSchema = Type.Object({
 
 export type SearchToolInput = Static<typeof searchSchema>;
 
-const DEFAULT_MATCH_LIMIT = 20;
+export const DEFAULT_MATCH_LIMIT = 100;
 
 export interface SearchToolDetails {
 	truncation?: TruncationResult;
@@ -67,6 +69,10 @@ export interface SearchToolDetails {
 	 * `result.text` lines but uses a `│` gutter and `*` to mark match lines (vs space for
 	 * context). The TUI uses this directly so it never parses model-facing hashline anchors. */
 	displayContent?: string;
+	/** User-supplied paths whose base directory was missing on disk. The tool
+	 * skipped these and continued with the surviving entries; surfaced as a
+	 * non-fatal warning in the renderer and in the model-facing text. */
+	missingPaths?: string[];
 }
 
 type SearchParams = Static<typeof searchSchema>;
@@ -74,6 +80,8 @@ type SearchParams = Static<typeof searchSchema>;
 export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDetails> {
 	readonly name = "search";
 	readonly label = "Search";
+	readonly loadMode = "discoverable";
+	readonly summary = "Search file contents using ripgrep (fast text search)";
 	readonly description: string;
 	readonly parameters = searchSchema;
 	readonly strict = true;
@@ -81,7 +89,7 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 	constructor(private readonly session: ToolSession) {
 		const displayMode = resolveFileDisplayMode(session);
 		this.description = prompt.render(searchDescription, {
-			IS_HASHLINE_MODE: displayMode.hashLines,
+			IS_HL_MODE: displayMode.hashLines,
 			IS_LINE_NUMBER_MODE: !displayMode.hashLines && displayMode.lineNumbers,
 		});
 	}
@@ -93,7 +101,7 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 		_onUpdate?: AgentToolUpdateCallback<SearchToolDetails>,
 		_toolContext?: AgentToolContext,
 	): Promise<AgentToolResult<SearchToolDetails>> {
-		const { pattern, path: searchDir, i, gitignore, skip } = params;
+		const { pattern, paths, i, gitignore, skip } = params;
 
 		return untilAborted(signal, async () => {
 			const normalizedPattern = pattern.trim();
@@ -119,12 +127,17 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 			let exactFilePaths: string[] | undefined;
 			let multiTargets: Array<{ basePath: string; glob?: string }> | undefined;
 			let globFilter: string | undefined;
-			const rawPath = normalizePathLikeInput(searchDir);
-			if (rawPath.length === 0) {
-				throw new ToolError("`path` must be a non-empty path or glob");
+			const rawPaths = paths.map(normalizePathLikeInput);
+			if (rawPaths.some(rawPath => rawPath.length === 0)) {
+				throw new ToolError("`paths` must contain non-empty paths or globs");
 			}
 			const internalRouter = this.session.internalRouter;
-			if (internalRouter?.canHandle(rawPath)) {
+			const resolvedPathInputs: string[] = [];
+			for (const rawPath of rawPaths) {
+				if (!internalRouter?.canHandle(rawPath)) {
+					resolvedPathInputs.push(rawPath);
+					continue;
+				}
 				if (hasGlobPathChars(rawPath)) {
 					throw new ToolError(`Glob patterns are not supported for internal URLs: ${rawPath}`);
 				}
@@ -132,29 +145,43 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 				if (!resource.sourcePath) {
 					throw new ToolError(`Cannot search internal URL without a backing file: ${rawPath}`);
 				}
-				searchPath = resource.sourcePath;
+				resolvedPathInputs.push(resource.sourcePath);
+			}
+			// Tolerate missing entries in a multi-path call: skip ones whose base
+			// directory is gone, and only error if every entry is missing. Single
+			// missing path keeps the original ENOENT semantics.
+			let missingPaths: string[] = [];
+			let effectivePaths = resolvedPathInputs;
+			if (resolvedPathInputs.length > 1) {
+				const partition = await partitionExistingPaths(resolvedPathInputs, this.session.cwd, parseSearchPath);
+				if (partition.valid.length === 0) {
+					throw new ToolError(`Path not found: ${partition.missing.join(", ")}`);
+				}
+				effectivePaths = partition.valid;
+				missingPaths = partition.missing;
+			}
+			if (effectivePaths.length === 1) {
+				const parsedPath = parseSearchPath(effectivePaths[0] ?? ".");
+				searchPath = resolveToCwd(parsedPath.basePath, this.session.cwd);
+				globFilter = parsedPath.glob;
 				scopePath = formatScopePath(searchPath);
 			} else {
-				const multiSearchPath = await resolveMultiSearchPath(rawPath, this.session.cwd, globFilter);
-				if (multiSearchPath) {
-					searchPath = multiSearchPath.basePath;
-					exactFilePaths = multiSearchPath.exactFilePaths;
-					multiTargets = multiSearchPath.targets;
-					globFilter = exactFilePaths || multiTargets ? undefined : multiSearchPath.glob;
-					scopePath = multiSearchPath.scopePath;
-				} else {
-					const parsedPath = parseSearchPath(rawPath);
-					searchPath = resolveToCwd(parsedPath.basePath, this.session.cwd);
-					globFilter = parsedPath.glob;
-					scopePath = formatScopePath(searchPath);
+				const multiSearchPath = await resolveExplicitSearchPaths(effectivePaths, this.session.cwd, globFilter);
+				if (!multiSearchPath) {
+					throw new ToolError("`paths` must contain at least one path or glob");
 				}
+				searchPath = multiSearchPath.basePath;
+				exactFilePaths = multiSearchPath.exactFilePaths;
+				multiTargets = multiSearchPath.targets;
+				globFilter = exactFilePaths || multiTargets ? undefined : multiSearchPath.glob;
+				scopePath = multiSearchPath.scopePath;
 			}
 			let isDirectory: boolean;
 			try {
 				const stat = await Bun.file(searchPath).stat();
 				isDirectory = stat.isDirectory();
 			} catch {
-				const hint = scopePath.includes(",") ? ` (comma-separated paths must each exist relative to cwd)` : "";
+				const hint = rawPaths.length > 1 ? " (`paths` entries must each exist relative to cwd)" : "";
 				throw new ToolError(`Path not found: ${scopePath}${hint}`);
 			}
 
@@ -275,9 +302,11 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 				: result.matches.slice(0, effectiveLimit);
 			const matchLimitReached = result.matches.length > effectiveLimit;
 			const nextSkip = normalizedSkip + selectedMatches.length;
-			const limitMessage = `Result limit reached; narrow path or use skip=${nextSkip}.`;
+			const limitMessage = `Result limit reached; narrow paths or use skip=${nextSkip}.`;
 			const { record: recordFile, list: fileList } = createFileRecorder();
 			const fileMatchCounts = new Map<string, number>();
+			const missingPathsNote =
+				missingPaths.length > 0 ? `Skipped missing paths: ${missingPaths.join(", ")}` : undefined;
 			if (selectedMatches.length === 0) {
 				const details: SearchToolDetails = {
 					scopePath,
@@ -285,8 +314,10 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 					fileCount: 0,
 					files: [],
 					truncated: false,
+					missingPaths: missingPaths.length > 0 ? missingPaths : undefined,
 				};
-				return toolResult(details).text("No matches found").done();
+				const text = missingPathsNote ? `No matches found\n${missingPathsNote}` : "No matches found";
+				return toolResult(details).text(text).done();
 			}
 			const outputLines: string[] = [];
 			let linesTruncated = false;
@@ -358,6 +389,9 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 			if (matchLimitReached || result.limitReached) {
 				outputLines.push("", limitMessage);
 			}
+			if (missingPathsNote) {
+				outputLines.push("", missingPathsNote);
+			}
 			const rawOutput = outputLines.join("\n");
 			const truncation = truncateHead(rawOutput, { maxLines: Number.MAX_SAFE_INTEGER });
 			const output = truncation.content;
@@ -375,6 +409,7 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 				matchLimitReached: matchLimitReached ? effectiveLimit : undefined,
 				resultLimitReached: result.limitReached ? internalLimit : undefined,
 				displayContent: displayLines.join("\n"),
+				missingPaths: missingPaths.length > 0 ? missingPaths : undefined,
 			};
 			if (truncation.truncated) details.truncation = truncation;
 			if (linesTruncated) details.linesTruncated = true;
@@ -395,7 +430,7 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 
 interface SearchRenderArgs {
 	pattern: string;
-	path?: string;
+	paths?: string[];
 	i?: boolean;
 	gitignore?: boolean;
 	skip?: number;
@@ -407,7 +442,7 @@ export const searchToolRenderer = {
 	inline: true,
 	renderCall(args: SearchRenderArgs, _options: RenderResultOptions, uiTheme: Theme): Component {
 		const meta: string[] = [];
-		if (args.path) meta.push(`in ${args.path}`);
+		if (args.paths?.length) meta.push(`in ${args.paths.join(", ")}`);
 		if (args.i) meta.push("case:insensitive");
 		if (args.gitignore === false) meta.push("gitignore:false");
 		if (args.skip !== undefined && args.skip > 0) meta.push(`skip:${args.skip}`);
@@ -480,12 +515,20 @@ export const searchToolRenderer = {
 			details?.truncated || truncation || limits?.matchLimit || limits?.resultLimit || limits?.columnTruncated,
 		);
 
+		const missingPathsList = details?.missingPaths ?? [];
+		const missingNote =
+			missingPathsList.length > 0
+				? uiTheme.fg("warning", `skipped missing: ${missingPathsList.join(", ")}`)
+				: undefined;
+
 		if (matchCount === 0) {
 			const header = renderStatusLine(
 				{ icon: "warning", title: "Search", description: args?.pattern, meta: ["0 matches"] },
 				uiTheme,
 			);
-			return new Text([header, formatEmptyMessage("No matches found", uiTheme)].join("\n"), 0, 0);
+			const lines = [header, formatEmptyMessage("No matches found", uiTheme)];
+			if (missingNote) lines.push(missingNote);
+			return new Text(lines.join("\n"), 0, 0);
 		}
 
 		const summaryParts = [formatCount("match", matchCount), formatCount("file", fileCount)];
@@ -531,8 +574,11 @@ export const searchToolRenderer = {
 		if (limits?.columnTruncated) truncationReasons.push(`line length ${limits.columnTruncated.maxColumn}`);
 		if (truncation?.artifactId) truncationReasons.push(formatFullOutputReference(truncation.artifactId));
 
-		const extraLines =
-			truncationReasons.length > 0 ? [uiTheme.fg("warning", `truncated: ${truncationReasons.join(", ")}`)] : [];
+		const extraLines: string[] = [];
+		if (truncationReasons.length > 0) {
+			extraLines.push(uiTheme.fg("warning", `truncated: ${truncationReasons.join(", ")}`));
+		}
+		if (missingNote) extraLines.push(missingNote);
 
 		let cached: RenderCache | undefined;
 		return {

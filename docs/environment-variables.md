@@ -215,7 +215,10 @@ OAuth host chain: `KIMI_CODE_OAUTH_HOST` → `KIMI_OAUTH_HOST` → `https://auth
 | `KAGI_API_KEY`                                      | Kagi search provider                                          |
 | `JINA_API_KEY`                                      | Jina search provider                                          |
 | `PARALLEL_API_KEY`                                  | Parallel search provider                                      |
-| `SEARXNG_ENDPOINT`, `SEARXNG_TOKEN`                 | SearXNG endpoint and bearer token                             |
+| `SEARXNG_ENDPOINT`, `SEARXNG_TOKEN`                 | SearXNG endpoint and optional bearer token                    |
+| `SEARXNG_BASIC_USERNAME`, `SEARXNG_BASIC_PASSWORD`  | SearXNG HTTP Basic Auth credentials                           |
+
+SearXNG also reads the equivalent `searxng.endpoint`, `searxng.token`, `searxng.basicUsername`, and `searxng.basicPassword` settings from `~/.omp/agent/config.yml`; environment variables are fallbacks.
 
 ### Anthropic web search auth chain
 
@@ -287,7 +290,6 @@ Extra conditional behavior:
 | `OLLAMA_BASE_URL`            | Default implicit Ollama discovery base URL override (`http://127.0.0.1:11434` if unset)            |
 | `LLAMA_CPP_BASE_URL`         | Default implicit Llama.cpp discovery base URL override (`http://127.0.0.1:8080` if unset)          |
 | `PI_EDIT_VARIANT`            | Forces edit tool variant when valid (`patch`, `replace`, `hashline`, `atom`, `vim`, `apply_patch`) |
-| `PI_STRICT_EDIT_MODE`        | If truthy, disables automatic edit-mode fallback                                                   |
 | `PI_FORCE_IMAGE_PROTOCOL`    | Forces supported image protocol (`kitty`, `iterm2`/`iterm`, `sixel`, `none`) where used            |
 | `PI_ALLOW_SIXEL_PASSTHROUGH` | Allows SIXEL passthrough when `PI_FORCE_IMAGE_PROTOCOL=sixel`                                      |
 | `PI_NO_PTY`                  | If `1`, disables interactive PTY path for bash tool                                                |

@@ -17,6 +17,7 @@ import { SETTINGS_SCHEMA, type SettingPath } from "../config/settings-schema";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import { runExtensionCompact, runExtensionSetModel } from "../extensibility/extensions/compact-handler";
 import type { Skill } from "../extensibility/skills";
+import type { HindsightSessionState } from "../hindsight/state";
 import type { LocalProtocolOptions } from "../internal-urls";
 import { callTool } from "../mcp/client";
 import type { MCPManager } from "../mcp/manager";
@@ -163,6 +164,7 @@ export interface ExecutorOptions {
 	settings?: Settings;
 	/** Override local:// protocol options so subagent shares parent's local:// root */
 	localProtocolOptions?: LocalProtocolOptions;
+	parentHindsightSessionState?: HindsightSessionState;
 }
 
 function parseStringifiedJson(value: unknown): unknown {
@@ -965,9 +967,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				contextFiles: options.contextFiles,
 				skills: options.skills,
 				promptTemplates: options.promptTemplates,
-				systemPrompt: defaultPrompt =>
+				systemPrompt: defaultPrompt => [
 					prompt.render(subagentSystemPromptTemplate, {
-						base: defaultPrompt,
+						base: defaultPrompt.join("\n\n"),
 						agent: agent.systemPrompt,
 						worktree: worktree ?? "",
 						outputSchema: normalizedOutputSchema,
@@ -975,10 +977,12 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						ircPeers: ircEnabled ? renderIrcPeerRoster(id) : "",
 						ircSelfId: ircEnabled ? id : "",
 					}),
+				],
 				sessionManager,
 				hasUI: false,
 				spawns: spawnsEnv,
 				taskDepth: childDepth,
+				parentHindsightSessionState: options.parentHindsightSessionState,
 				parentTaskPrefix: id,
 				agentId: id,
 				agentDisplayName: agent.name,
@@ -1013,7 +1017,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			}
 
 			session.sessionManager.appendSessionInit({
-				systemPrompt: session.agent.state.systemPrompt,
+				systemPrompt: session.agent.state.systemPrompt.join("\n\n"),
 				task,
 				tools: session.getActiveToolNames(),
 				outputSchema,

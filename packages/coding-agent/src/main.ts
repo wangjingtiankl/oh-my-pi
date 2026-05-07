@@ -5,19 +5,25 @@
  * createAgentSession() options. The SDK does the heavy lifting.
  */
 
-import { realpathSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { createInterface } from "node:readline/promises";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
-import { $env, getConfigDirName, getProjectDir, logger, postmortem, setProjectDir, VERSION } from "@oh-my-pi/pi-utils";
+import {
+	$env,
+	getProjectDir,
+	logger,
+	normalizePathForComparison,
+	postmortem,
+	setProjectDir,
+	VERSION,
+} from "@oh-my-pi/pi-utils";
 import chalk from "chalk";
-import { invalidate as invalidateFsCache } from "./capability/fs";
 import type { Args } from "./cli/args";
 import { processFileArguments } from "./cli/file-processor";
 import { buildInitialMessage } from "./cli/initial-message";
-import { listModels } from "./cli/list-models";
+import { runListModelsCommand } from "./cli/list-models";
 import { selectSession } from "./cli/session-picker";
 import { findConfigFile } from "./config";
 import { ModelRegistry, ModelsConfigFile } from "./config/model-registry";
@@ -25,7 +31,7 @@ import { resolveCliModel, resolveModelRoleValue, resolveModelScope, type ScopedM
 import { getDefault, type SettingPath, Settings, settings } from "./config/settings";
 import { initializeWithSettings } from "./discovery";
 import {
-	clearClaudePluginRootsCache,
+	clearPluginRootsAndCaches,
 	injectPluginDirRoots,
 	preloadPluginRoots,
 	resolveActiveProjectRegistryPath,
@@ -90,6 +96,10 @@ const RPC_DEFAULTED_SETTING_PATHS: SettingPath[] = [
 	"task.maxRecursionDepth",
 	"task.disabledAgents",
 	"task.agentModelOverrides",
+	// Memory subsystems are off-by-default for RPC hosts; embedders that want
+	// memory should opt in explicitly through their own settings layer.
+	"memory.backend",
+	"memories.enabled",
 ];
 
 function applyRpcDefaultSettingOverrides(): void {
@@ -211,15 +221,6 @@ async function runInteractiveMode(
 		const input = await mode.getUserInput();
 		await submitInteractiveInput(mode, session, input);
 	}
-}
-
-function normalizePathForComparison(value: string): string {
-	const resolved = path.resolve(value);
-	let realPath = resolved;
-	try {
-		realPath = realpathSync(resolved);
-	} catch {}
-	return process.platform === "win32" ? realPath.toLowerCase() : realPath;
 }
 
 async function promptForkSession(session: SessionInfo): Promise<boolean> {
@@ -350,10 +351,7 @@ async function maybeAutoChdir(parsed: Args): Promise<void> {
 		return;
 	}
 
-	const normalizePath = (value: string) => {
-		const resolved = realpathSync(path.resolve(value));
-		return process.platform === "win32" ? resolved.toLowerCase() : resolved;
-	};
+	const normalizePath = normalizePathForComparison;
 
 	const cwd = normalizePath(getProjectDir());
 	const normalizedHome = normalizePath(home);
@@ -537,11 +535,11 @@ async function buildSessionOptions(
 
 	// System prompt
 	if (resolvedSystemPrompt && resolvedAppendPrompt) {
-		options.systemPrompt = `${resolvedSystemPrompt}\n\n${resolvedAppendPrompt}`;
+		options.systemPrompt = defaultPrompt => [resolvedSystemPrompt, resolvedAppendPrompt, ...defaultPrompt.slice(1)];
 	} else if (resolvedSystemPrompt) {
-		options.systemPrompt = resolvedSystemPrompt;
+		options.systemPrompt = defaultPrompt => [resolvedSystemPrompt, ...defaultPrompt.slice(1)];
 	} else if (resolvedAppendPrompt) {
-		options.systemPrompt = defaultPrompt => `${defaultPrompt}\n\n${resolvedAppendPrompt}`;
+		options.systemPrompt = defaultPrompt => [...defaultPrompt, resolvedAppendPrompt];
 	}
 
 	// Tools
@@ -604,10 +602,25 @@ export async function runRootCommand(parsed: Args, rawArgs: string[]): Promise<v
 	}
 
 	if (parsedArgs.listModels !== undefined) {
-		await logger.time("settings:init:list-models", Settings.init, { cwd: getProjectDir() });
+		const settingsInstance = await logger.time("settings:init:list-models", Settings.init, {
+			cwd: getProjectDir(),
+		});
 		await modelRegistry.refresh("online");
+		const cliExtensionPaths = parsedArgs.noExtensions
+			? []
+			: [...(parsedArgs.extensions ?? []), ...(parsedArgs.hooks ?? [])];
+		const settingsExtensions = settingsInstance.get("extensions") ?? [];
+		const disabledExtensionIds = settingsInstance.get("disabledExtensions") ?? [];
 		const searchPattern = typeof parsedArgs.listModels === "string" ? parsedArgs.listModels : undefined;
-		await listModels(modelRegistry, searchPattern);
+		await runListModelsCommand({
+			modelRegistry,
+			cwd: getProjectDir(),
+			additionalExtensionPaths: cliExtensionPaths,
+			settingsExtensions,
+			disabledExtensionIds,
+			disableExtensionDiscovery: Boolean(parsedArgs.noExtensions),
+			searchPattern,
+		});
 		process.exit(0);
 	}
 
@@ -743,13 +756,7 @@ export async function runRootCommand(parsed: Args, rawArgs: string[]): Promise<v
 					projectInstalledRegistryPath: (await resolveActiveProjectRegistryPath(getProjectDir())) ?? undefined,
 					marketplacesCacheDir: getMarketplacesCacheDir(),
 					pluginsCacheDir: getPluginsCacheDir(),
-					clearPluginRootsCache: (extraPaths?: readonly string[]) => {
-						const h = os.homedir();
-						invalidateFsCache(path.join(h, ".claude", "plugins", "installed_plugins.json"));
-						invalidateFsCache(path.join(h, getConfigDirName(), "plugins", "installed_plugins.json"));
-						for (const p of extraPaths ?? []) invalidateFsCache(p);
-						clearClaudePluginRootsCache();
-					},
+					clearPluginRootsCache: clearPluginRootsAndCaches,
 				});
 				await mgr.refreshStaleMarketplaces();
 				const updates = await mgr.checkForUpdates();

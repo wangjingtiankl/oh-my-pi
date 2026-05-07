@@ -1,13 +1,7 @@
-import * as os from "node:os";
-import * as path from "node:path";
-
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/utils/oauth";
-import { getConfigDirName } from "@oh-my-pi/pi-utils";
-import { invalidate as invalidateFsCache } from "../capability/fs";
 import type { SettingPath, SettingValue } from "../config/settings";
 import { settings } from "../config/settings";
 import {
-	clearClaudePluginRootsCache,
 	clearPluginRootsAndCaches,
 	resolveActiveProjectRegistryPath,
 	resolveOrDefaultProjectRegistryPath,
@@ -63,8 +57,8 @@ interface BuiltinSlashCommandSpec extends BuiltinSlashCommand {
 	handle: (
 		command: ParsedBuiltinSlashCommand,
 		runtime: BuiltinSlashCommandRuntime,
-		// biome-ignore lint/suspicious/noConfusingVoidType: void needed so handlers returning nothing are assignable
-	) => Promise<string | undefined> | string | void;
+		// biome-ignore lint/suspicious/noConfusingVoidType: void needed so async handlers returning nothing are assignable
+	) => Promise<string | void> | string | void;
 }
 
 export interface BuiltinSlashCommandRuntime {
@@ -579,6 +573,17 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<BuiltinSlashCommandSpec> = [
 		},
 	},
 	{
+		name: "retry",
+		description: "Retry the last failed agent turn",
+		handle: async (_command, runtime) => {
+			const didRetry = await runtime.ctx.session.retry();
+			if (!didRetry) {
+				runtime.ctx.showStatus("Nothing to retry");
+			}
+			runtime.ctx.editor.setText("");
+		},
+	},
+	{
 		name: "background",
 		aliases: ["bg"],
 		description: "Detach UI and continue running in background",
@@ -604,6 +609,16 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<BuiltinSlashCommandSpec> = [
 			{ name: "reset", description: "Alias for clear" },
 			{ name: "enqueue", description: "Enqueue memory consolidation maintenance" },
 			{ name: "rebuild", description: "Alias for enqueue" },
+			{ name: "mm list", description: "List mental models on the active bank" },
+			{ name: "mm show", description: "Show one mental model (id required)" },
+			{
+				name: "mm refresh",
+				description: "Refresh auto-refresh models bank-wide, or one model by id",
+			},
+			{ name: "mm history", description: "Diff the change history of a mental model" },
+			{ name: "mm seed", description: "Create any built-in mental models that are missing" },
+			{ name: "mm delete", description: "Delete a mental model from the bank (id required)" },
+			{ name: "mm reload", description: "Re-pull the cached <mental_models> block" },
 		],
 		allowArgs: true,
 		handle: async (command, runtime) => {
@@ -942,14 +957,10 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<BuiltinSlashCommandSpec> = [
 		name: "reload-plugins",
 		description: "Reload all plugins (skills, commands, hooks, tools, agents, MCP)",
 		handle: async (_command, runtime) => {
-			// Invalidate the fs content cache for all registry files so
+			// Invalidate registry fs caches and the plugin roots cache so
 			// listClaudePluginRoots re-reads from disk on next access.
-			const home = os.homedir();
-			invalidateFsCache(path.join(home, ".claude", "plugins", "installed_plugins.json"));
-			invalidateFsCache(path.join(home, getConfigDirName(), "plugins", "installed_plugins.json"));
 			const projectPath = await resolveActiveProjectRegistryPath(runtime.ctx.sessionManager.getCwd());
-			if (projectPath) invalidateFsCache(projectPath);
-			clearClaudePluginRootsCache();
+			clearPluginRootsAndCaches(projectPath ? [projectPath] : undefined);
 			await runtime.ctx.refreshSlashCommandState();
 			runtime.ctx.showStatus("Plugins reloaded.");
 			runtime.ctx.editor.setText("");

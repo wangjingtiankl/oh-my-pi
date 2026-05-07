@@ -145,6 +145,14 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * When set and returns a value, overrides the static `toolChoice`.
 	 */
 	getToolChoice?: () => ToolChoice | undefined;
+
+	/**
+	 * Dynamic reasoning effort override, resolved per LLM call.
+	 * When set and returns a value, overrides the static `reasoning` captured
+	 * at run-loop start. Use this so mid-run thinking-level changes apply on
+	 * the next model call instead of waiting for the next prompt.
+	 */
+	getReasoning?: () => Effort | undefined;
 }
 
 export interface ToolCallContext {
@@ -183,7 +191,7 @@ export type AgentMessage = Message | CustomAgentMessages[keyof CustomAgentMessag
  * Agent state containing all configuration and conversation data.
  */
 export interface AgentState {
-	systemPrompt: string;
+	systemPrompt: string[];
 	model: Model;
 	thinkingLevel?: Effort;
 	tools: AgentTool<any>[];
@@ -240,6 +248,10 @@ export interface AgentTool<TParameters extends TSchema = TSchema, TDetails = any
 	hidden?: boolean;
 	/** If true, tool can stage a pending action that requires explicit resolution via the resolve tool. */
 	deferrable?: boolean;
+	/** Built-in tool loading behavior. "essential" loads initially; "discoverable" can be activated by tool search. */
+	loadMode?: "essential" | "discoverable";
+	/** Short one-line summary used for tool discovery indexes. */
+	summary?: string;
 	/** If true, tool execution ignores abort signals (runs to completion) */
 	nonAbortable?: boolean;
 	/**
@@ -275,7 +287,7 @@ export interface AgentTool<TParameters extends TSchema = TSchema, TDetails = any
 
 // AgentContext is like Context but uses AgentTool
 export interface AgentContext {
-	systemPrompt: string;
+	systemPrompt: string[];
 	messages: AgentMessage[];
 	tools?: AgentTool<any>[];
 }

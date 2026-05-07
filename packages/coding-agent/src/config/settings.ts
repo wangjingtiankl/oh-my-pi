@@ -12,6 +12,7 @@
  */
 
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import {
 	getAgentDbPath,
@@ -96,6 +97,74 @@ function setByPath(obj: RawSettings, segments: string[], value: unknown): void {
 		current = current[segment] as RawSettings;
 	}
 	current[segments[segments.length - 1]] = value;
+}
+
+const PATH_SCOPED_ARRAY_SETTINGS = new Set<SettingPath>(["enabledModels", "disabledProviders"]);
+
+type PathScopedStringArrayEntry = {
+	path?: unknown;
+	paths?: unknown;
+	pathPrefix?: unknown;
+	pathPrefixes?: unknown;
+	values?: unknown;
+	items?: unknown;
+	models?: unknown;
+	providers?: unknown;
+};
+
+function normalizePathPrefix(prefix: string): string {
+	const expanded =
+		prefix === "~" ? os.homedir() : prefix.startsWith("~/") ? path.join(os.homedir(), prefix.slice(2)) : prefix;
+	return path.resolve(expanded);
+}
+
+function pathMatchesPrefix(cwd: string, prefix: string): boolean {
+	const relative = path.relative(normalizePathPrefix(prefix), path.resolve(cwd));
+	return relative === "" || (!!relative && !relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function stringArrayFromUnknown(value: unknown): string[] {
+	if (typeof value === "string") return [value];
+	if (Array.isArray(value)) return value.filter((item): item is string => typeof item === "string");
+	return [];
+}
+
+function resolvePathScopedStringArray(settingPath: SettingPath, value: unknown, cwd: string): string[] | undefined {
+	if (!PATH_SCOPED_ARRAY_SETTINGS.has(settingPath) || !Array.isArray(value)) return undefined;
+
+	const resolved: string[] = [];
+	for (const entry of value) {
+		if (typeof entry === "string") {
+			resolved.push(entry);
+			continue;
+		}
+		if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+
+		const scoped = entry as PathScopedStringArrayEntry;
+		const prefixes = [
+			...stringArrayFromUnknown(scoped.path),
+			...stringArrayFromUnknown(scoped.paths),
+			...stringArrayFromUnknown(scoped.pathPrefix),
+			...stringArrayFromUnknown(scoped.pathPrefixes),
+		];
+		if (prefixes.length === 0 || !prefixes.some(prefix => pathMatchesPrefix(cwd, prefix))) continue;
+
+		const values =
+			settingPath === "enabledModels"
+				? [
+						...stringArrayFromUnknown(scoped.values),
+						...stringArrayFromUnknown(scoped.items),
+						...stringArrayFromUnknown(scoped.models),
+					]
+				: [
+						...stringArrayFromUnknown(scoped.values),
+						...stringArrayFromUnknown(scoped.items),
+						...stringArrayFromUnknown(scoped.providers),
+					];
+		resolved.push(...values);
+	}
+
+	return resolved;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -201,7 +270,8 @@ export class Settings {
 		const segments = path.split(".");
 		const value = getByPath(this.#merged, segments);
 		if (value !== undefined) {
-			return value as SettingValue<P>;
+			const pathScopedValue = resolvePathScopedStringArray(path, value, this.#cwd);
+			return (pathScopedValue ?? value) as SettingValue<P>;
 		}
 		return getDefault(path);
 	}
@@ -326,7 +396,7 @@ export class Settings {
 
 	/**
 	 * Get the edit variant for a specific model.
-	 * Returns "patch", "replace", "hashline", "atom", "vim", "apply_patch", or null (use global default).
+	 * Returns "patch", "replace", "hashline", "vim", "apply_patch", or null (use global default).
 	 */
 	getEditVariantForModel(model: string | undefined): EditMode | null {
 		if (!model) return null;
@@ -533,6 +603,25 @@ export class Settings {
 			delete isolationObj.enabled;
 		}
 
+		// edit.mode: removed "atom" variant is now "hashline"
+		const editObj = raw.edit as Record<string, unknown> | undefined;
+		if (editObj) {
+			if (editObj.mode === "atom") {
+				editObj.mode = "hashline";
+			}
+			const modelVariants = editObj.modelVariants as Record<string, unknown> | undefined;
+			if (modelVariants && typeof modelVariants === "object" && !Array.isArray(modelVariants)) {
+				for (const [pattern, variant] of Object.entries(modelVariants)) {
+					if (variant === "atom") {
+						modelVariants[pattern] = "hashline";
+					}
+				}
+			}
+		}
+		if (raw["edit.mode"] === "atom") {
+			raw["edit.mode"] = "hashline";
+		}
+
 		// statusLine: rename "plan_mode" segment to "mode"
 		const statusLineObj = raw.statusLine as Record<string, unknown> | undefined;
 		if (statusLineObj) {
@@ -546,6 +635,48 @@ export class Settings {
 			if (segmentOptions && "plan_mode" in segmentOptions && !("mode" in segmentOptions)) {
 				segmentOptions.mode = segmentOptions.plan_mode;
 				delete segmentOptions.plan_mode;
+			}
+		}
+
+		// Map legacy `memories.enabled` boolean to the explicit `memory.backend`
+		// enum if the latter hasn't been set yet. Idempotent: subsequent
+		// migrations are no-ops once memory.backend is materialised.
+		const memoryBackendObj = raw.memory as Record<string, unknown> | undefined;
+		const memoryBackendSet = memoryBackendObj && typeof memoryBackendObj.backend === "string";
+		const memoriesObj = raw.memories as Record<string, unknown> | undefined;
+		if (!memoryBackendSet && memoriesObj && typeof memoriesObj.enabled === "boolean") {
+			const next = memoriesObj.enabled ? "local" : "off";
+			const memoryRoot = (memoryBackendObj ?? {}) as Record<string, unknown>;
+			memoryRoot.backend = next;
+			raw.memory = memoryRoot;
+		}
+
+		// hindsight: dynamicBankId/agentName -> scoping enum + bankId
+		// - dynamicBankId=true  → scoping="per-project" (closest semantic match;
+		//   the legacy `agent::project::channel::user` tuple was per-project in
+		//   practice — the channel/user env vars were rarely set).
+		// - hindsight.agentName was only used as the agent slot in the legacy
+		//   dynamic tuple; if the user customised it we surface it as the new
+		//   bankId base when no explicit bankId is set.
+		const hindsightObj = raw.hindsight as Record<string, unknown> | undefined;
+		if (hindsightObj) {
+			if ("dynamicBankId" in hindsightObj) {
+				if (!("scoping" in hindsightObj) && hindsightObj.dynamicBankId === true) {
+					hindsightObj.scoping = "per-project";
+				}
+				delete hindsightObj.dynamicBankId;
+			}
+			if ("agentName" in hindsightObj) {
+				const agentName = hindsightObj.agentName;
+				if (
+					!("bankId" in hindsightObj) &&
+					typeof agentName === "string" &&
+					agentName.trim().length > 0 &&
+					agentName !== "omp"
+				) {
+					hindsightObj.bankId = agentName;
+				}
+				delete hindsightObj.agentName;
 			}
 		}
 
@@ -693,6 +824,10 @@ const SETTING_HOOKS: Partial<Record<SettingPath, SettingHook<any>>> = {
 
 let globalInstance: Settings | null = null;
 let globalInstancePromise: Promise<Settings> | null = null;
+
+export function isSettingsInitialized(): boolean {
+	return globalInstance !== null;
+}
 
 /**
  * Reset the global singleton for testing.
