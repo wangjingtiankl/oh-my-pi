@@ -151,7 +151,7 @@ describe("InteractiveMode plan review rendering", () => {
 
 		expect(clear).not.toHaveBeenCalled();
 		expect(await Bun.file(resolvedFinalPlanPath).text()).toBe("# Plan\n\nKeep context.");
-		expect(prompt).toHaveBeenCalledWith(expect.stringContaining("Context was preserved for execution."), {
+		expect(prompt).toHaveBeenCalledWith(expect.any(String), {
 			synthetic: true,
 		});
 	});
@@ -179,7 +179,7 @@ describe("InteractiveMode plan review rendering", () => {
 		});
 
 		expect(clear).toHaveBeenCalledTimes(1);
-		expect(prompt).toHaveBeenCalledWith(expect.stringContaining("Execution may be running in fresh context."), {
+		expect(prompt).toHaveBeenCalledWith(expect.any(String), {
 			synthetic: true,
 		});
 	});

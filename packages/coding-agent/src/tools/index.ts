@@ -14,11 +14,13 @@ import type { PlanModeState } from "../plan-mode/state";
 import type { AgentRegistry } from "../registry/agent-registry";
 import type { CustomMessage } from "../session/messages";
 import type { ToolChoiceQueue } from "../session/tool-choice-queue";
+import type { AgentsMdSearch } from "../system-prompt";
 import { TaskTool } from "../task";
 import type { AgentOutputManager } from "../task/output-manager";
 import type { DiscoverableTool, DiscoverableToolSearchIndex } from "../tool-discovery/tool-index";
 import type { EventBus } from "../utils/event-bus";
 import { WebSearchTool } from "../web/search";
+import type { WorkspaceTree } from "../workspace-tree";
 import { AskTool } from "./ask";
 import { AstEditTool } from "./ast-edit";
 import { AstGrepTool } from "./ast-grep";
@@ -37,7 +39,6 @@ import { HindsightRetainTool } from "./hindsight-retain";
 import { InspectImageTool } from "./inspect-image";
 import { IrcTool } from "./irc";
 import { JobTool } from "./job";
-import { NotebookTool } from "./notebook";
 import { wrapToolWithMetaNotice } from "./output-meta";
 import { ReadTool } from "./read";
 import { RecipeTool } from "./recipe";
@@ -80,7 +81,6 @@ export * from "./image-gen";
 export * from "./inspect-image";
 export * from "./irc";
 export * from "./job";
-export * from "./notebook";
 export * from "./read";
 export * from "./recipe";
 export * from "./render-mermaid";
@@ -122,6 +122,10 @@ export interface ToolSession {
 	skipPythonPreflight?: boolean;
 	/** Pre-loaded context files (AGENTS.md, etc) */
 	contextFiles?: ContextFileEntry[];
+	/** Pre-loaded AGENTS.md search (forwarded to subagents to skip re-scanning) */
+	agentsMdSearch?: AgentsMdSearch;
+	/** Pre-loaded workspace tree (forwarded to subagents to skip re-scanning) */
+	workspaceTree?: WorkspaceTree;
 	/** Pre-loaded skills */
 	skills?: Skill[];
 	/** Pre-loaded prompt templates */
@@ -271,7 +275,6 @@ export const BUILTIN_TOOLS: Record<string, ToolFactory> = {
 	find: s => new FindTool(s),
 	search: s => new SearchTool(s),
 	lsp: LspTool.createIf,
-	notebook: s => new NotebookTool(s),
 	inspect_image: s => new InspectImageTool(s),
 	browser: s => new BrowserTool(s),
 	checkpoint: CheckpointTool.createIf,
@@ -430,7 +433,6 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		if (name === "ast_grep") return session.settings.get("astGrep.enabled");
 		if (name === "ast_edit") return session.settings.get("astEdit.enabled");
 		if (name === "render_mermaid") return session.settings.get("renderMermaid.enabled");
-		if (name === "notebook") return session.settings.get("notebook.enabled");
 		if (name === "inspect_image") return session.settings.get("inspect_image.enabled");
 		if (name === "web_search") return session.settings.get("web_search.enabled");
 		// search_tool_bm25 is allowed when either legacy mcp.discoveryMode or new tools.discoveryMode is active.

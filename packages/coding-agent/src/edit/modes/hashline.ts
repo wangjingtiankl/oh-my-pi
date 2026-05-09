@@ -52,6 +52,7 @@ import {
 	HL_HASH_CAPTURE_RE_RAW,
 } from "../line-hash";
 import { detectLineEnding, normalizeToLF, restoreLineEndings, stripBom } from "../normalize";
+import { readEditFileText, serializeEditFileText } from "../read-file";
 import type { EditToolDetails, LspBatchRequest } from "../renderer";
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -1547,7 +1548,7 @@ export function applyHashlineEdits(
 // but no header, we synthesize one from the caller-supplied `path` option.
 // ───────────────────────────────────────────────────────────────────────────
 
-interface HashlineInputSection {
+export interface HashlineInputSection {
 	path: string;
 	diff: string;
 }
@@ -1588,7 +1589,7 @@ function stripLeadingBlankLines(input: string): string {
 	return lines.join("\n");
 }
 
-function containsRecognizableHashlineOperations(input: string): boolean {
+export function containsRecognizableHashlineOperations(input: string): boolean {
 	for (const rawLine of input.split("\n")) {
 		const line = stripTrailingCarriageReturn(rawLine);
 		if (/^[+<=-]\s+/.test(line) || line.startsWith(HL_EDIT_SEP)) return true;
@@ -1656,30 +1657,27 @@ export function splitHashlineInputs(input: string, options: SplitHashlineOptions
 // 13. Diff computation (for streaming preview)
 // ───────────────────────────────────────────────────────────────────────────
 
-async function readHashlineFileText(file: { text(): Promise<string> }, pathText: string): Promise<string> {
+async function readHashlineFileText(
+	_file: { text(): Promise<string> },
+	absolutePath: string,
+	pathText: string,
+): Promise<string> {
 	try {
-		return await file.text();
+		return await readEditFileText(absolutePath, pathText);
 	} catch (error) {
-		if (isEnoent(error)) throw new Error(`File not found: ${pathText}`);
 		const message = error instanceof Error ? error.message : String(error);
 		throw new Error(message || `Unable to read ${pathText}`);
 	}
 }
 
-export async function computeHashlineDiff(
-	input: { input: string; path?: string },
+export async function computeHashlineSectionDiff(
+	section: HashlineInputSection,
 	cwd: string,
 	options: HashlineApplyOptions = {},
 ): Promise<{ diff: string; firstChangedLine: number | undefined } | { error: string }> {
 	try {
-		const sections = splitHashlineInputs(input.input, { cwd, path: input.path });
-		if (sections.length !== 1) {
-			return { error: "Streaming diff preview supports exactly one hashline section." };
-		}
-		const [section] = sections;
-
 		const absolutePath = resolveToCwd(section.path, cwd);
-		const rawContent = await readHashlineFileText(Bun.file(absolutePath), section.path);
+		const rawContent = await readHashlineFileText(Bun.file(absolutePath), absolutePath, section.path);
 		const { text: content } = stripBom(rawContent);
 		const normalized = normalizeToLF(content);
 		const result = applyHashlineEdits(normalized, parseHashline(section.diff), options);
@@ -1688,6 +1686,23 @@ export async function computeHashlineDiff(
 	} catch (err) {
 		return { error: err instanceof Error ? err.message : String(err) };
 	}
+}
+
+export async function computeHashlineDiff(
+	input: { input: string; path?: string },
+	cwd: string,
+	options: HashlineApplyOptions = {},
+): Promise<{ diff: string; firstChangedLine: number | undefined } | { error: string }> {
+	let sections: HashlineInputSection[];
+	try {
+		sections = splitHashlineInputs(input.input, { cwd, path: input.path });
+	} catch (err) {
+		return { error: err instanceof Error ? err.message : String(err) };
+	}
+	if (sections.length !== 1) {
+		return { error: "Streaming diff preview supports exactly one hashline section." };
+	}
+	return computeHashlineSectionDiff(sections[0], cwd, options);
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -1699,11 +1714,13 @@ interface ReadHashlineFileResult {
 	rawContent: string;
 }
 
-async function readHashlineFile(absolutePath: string): Promise<ReadHashlineFileResult> {
+async function readHashlineFile(absolutePath: string, pathText: string): Promise<ReadHashlineFileResult> {
 	try {
-		return { exists: true, rawContent: await Bun.file(absolutePath).text() };
+		return { exists: true, rawContent: await readEditFileText(absolutePath, pathText) };
 	} catch (error) {
 		if (isEnoent(error)) return { exists: false, rawContent: "" };
+		if (error instanceof Error && error.message === `File not found: ${pathText}`)
+			return { exists: false, rawContent: "" };
 		throw error;
 	}
 }
@@ -1746,7 +1763,7 @@ async function preflightHashlineSection(options: ExecuteHashlineSingleOptions & 
 	const { edits } = parseHashlineWithWarnings(diff);
 	enforcePlanModeWrite(session, sectionPath, { op: "update" });
 
-	const source = await readHashlineFile(absolutePath);
+	const source = await readHashlineFile(absolutePath, sectionPath);
 	if (!source.exists && hasAnchorScopedEdit(edits)) throw new Error(`File not found: ${sectionPath}`);
 	if (source.exists) assertEditableFileContent(source.rawContent, sectionPath);
 
@@ -1773,7 +1790,7 @@ async function executeHashlineSection(
 	const { edits, warnings: parseWarnings } = parseHashlineWithWarnings(diff);
 	enforcePlanModeWrite(session, sourcePath, { op: "update" });
 
-	const source = await readHashlineFile(absolutePath);
+	const source = await readHashlineFile(absolutePath, sourcePath);
 	if (!source.exists && hasAnchorScopedEdit(edits)) throw new Error(`File not found: ${sourcePath}`);
 	if (source.exists) assertEditableFileContent(source.rawContent, sourcePath);
 
@@ -1789,7 +1806,11 @@ async function executeHashlineSection(
 		};
 	}
 
-	const finalContent = bom + restoreLineEndings(result.lines, originalEnding);
+	const finalContent = await serializeEditFileText(
+		absolutePath,
+		sourcePath,
+		bom + restoreLineEndings(result.lines, originalEnding),
+	);
 	const diagnostics = await writethrough(
 		absolutePath,
 		finalContent,

@@ -2,6 +2,59 @@
 
 ## [Unreleased]
 
+## [14.7.8] - 2026-05-08
+
+### Fixed
+
+- Fixed indefinite startup hang on large repos introduced in 14.7.6 ([#975](https://github.com/can1357/oh-my-pi/issues/975)) on two fronts: (1) `createAgentSession` was awaiting `buildAgentsMdSearch` and `buildWorkspaceTree` directly in its blocking `Promise.all`, bypassing the existing 5s preparation deadline that previously protected startup — both scans are now raced against a 5s deadline and fall back to the system-prompt fallback path on timeout; (2) `buildWorkspaceTree` now derives its listing from `git ls-files --cached --others --exclude-standard` when the workspace is a git worktree, which is O(index size) and avoids the per-call full-tree gitignore-aware native scan that the previous implementation triggered. Repos without git, or where the call fails / times out, transparently fall back to the previous native-glob path.
+
+## [14.7.6] - 2026-05-07
+### Changed
+
+- Changed the "Hide Thinking Blocks" setting (Ctrl+T) to also instruct the provider to omit thinking/reasoning summaries from responses, instead of just hiding them client-side. Anthropic sees `thinking.display = "omitted"` (where supported); OpenAI Responses / Azure / Codex requests drop `reasoning.summary` entirely.
+
+### Fixed
+
+- Fixed the `Hide Thinking Blocks` toggle so changing it updates the active session’s request settings immediately, ensuring new responses reflect the current hide-thinking preference
+- Fixed system prompt preparation to keep successful context data and only fall back to minimal defaults for preparation steps that fail
+- Fixed system prompt preparation timeout to apply per-step instead of all-or-nothing: a single slow step (e.g. `buildAgentsMdSearch` on a huge directory tree, `buildWorkspaceTree`, `loadProjectContextFiles`) now falls back to its own minimal default while the other steps still populate, and the warning names which steps timed out.
+- Fixed subagents re-running expensive workspace scans (`buildAgentsMdSearch`, `buildWorkspaceTree`) on every spawn: parents now forward their already-resolved `AGENTS.md` search and workspace tree to subagents through `createAgentSession`, matching how `contextFiles`, `skills`, and `promptTemplates` are already inherited. On large monorepos this removes seconds of redundant work per `task` invocation and prevents the per-subagent system-prompt timeout warnings.
+
+## [14.7.5] - 2026-05-07
+### Added
+
+- Added optional `/loop` limits: `/loop 10` stops after 10 auto-iterations, while duration forms such as `/loop 10m` and `/loop 10min` stop after the time limit.
+
+### Changed
+
+- Changed `/loop` to include the configured limit and remaining budget in the enabled status message
+
+### Fixed
+
+- Fixed `/loop` handling of malformed count or duration arguments by showing usage errors instead of enabling unbounded loop mode
+- Fixed inherited disabled macOS malloc stack logging variables leaking into shell sessions and spamming Bun subprocess output with `MallocStackLogging` warnings.
+
+## [14.7.4] - 2026-05-07
+
+### Breaking Changes
+
+- Removed the dedicated `notebook` tool; `.ipynb` reads and edits now go through `read` and `edit`.
+
+### Changed
+
+- Changed diff previews to syntax-highlight contiguous context lines in the unchanged sections when file language can be detected
+- Changed `read` tool behavior for `.ipynb:raw` requests to return raw notebook content instead of converting via markit
+- Changed `.ipynb` edit and read handling to route through notebook serialization helpers
+- Changed `.ipynb` reads to return an editable cell text representation and apply edits back to notebook JSON while preserving cell metadata and outputs where possible.
+
+### Removed
+
+- Removed the `notebook.enabled` configuration option from tool settings
+
+### Fixed
+
+- Fixed hashline edit streaming preview collapsing to a header-only "opaque box" when a second `@PATH` section header arrived mid-stream — earlier completed sections now stay rendered while the trailing section is still being typed.
+
 ## [14.7.2] - 2026-05-06
 ### Breaking Changes
 

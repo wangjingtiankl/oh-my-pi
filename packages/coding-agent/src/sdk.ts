@@ -201,6 +201,10 @@ export interface CreateAgentSessionOptions {
 	rules?: Rule[];
 	/** Context files (AGENTS.md content). Default: discovered walking up from cwd */
 	contextFiles?: Array<{ path: string; content: string }>;
+	/** Pre-built AGENTS.md search (skips re-scanning the workspace; passed by parents to subagents). */
+	agentsMdSearch?: AgentsMdSearch;
+	/** Pre-built workspace tree (skips re-scanning; passed by parents to subagents). */
+	workspaceTree?: WorkspaceTree;
 	/** Prompt templates. Default: discovered from cwd/.omp/prompts/ + agentDir/prompts/ */
 	promptTemplates?: PromptTemplate[];
 	/** File-based slash commands. Default: discovered from commands/ directories */
@@ -687,11 +691,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	if (!options.modelRegistry) {
 		modelRegistry.refreshInBackground();
 	}
-	// Kick off AGENTS.md filesystem search in parallel — it is the slowest piece of buildSystemPrompt
-	// (~200ms on large repos) and only needs `cwd`, so it can overlap with everything that follows.
-	const agentsMdSearchPromise: Promise<AgentsMdSearch> = logger.time("buildAgentsMdSearch", buildAgentsMdSearch, cwd);
+	// Kick off AGENTS.md filesystem search and workspace tree in parallel — they are the slowest pieces of
+	// buildSystemPrompt (can be many seconds on large repos) and only need `cwd`, so they overlap with
+	// everything that follows. Subagents inherit the parent's resolved values via options.
+	const agentsMdSearchPromise: Promise<AgentsMdSearch> = options.agentsMdSearch
+		? Promise.resolve(options.agentsMdSearch)
+		: logger.time("buildAgentsMdSearch", buildAgentsMdSearch, cwd);
 	agentsMdSearchPromise.catch(() => {});
-	const workspaceTreePromise: Promise<WorkspaceTree> = logger.time("buildWorkspaceTree", buildWorkspaceTree, cwd);
+	const workspaceTreePromise: Promise<WorkspaceTree> = options.workspaceTree
+		? Promise.resolve(options.workspaceTree)
+		: logger.time("buildWorkspaceTree", buildWorkspaceTree, cwd);
 	workspaceTreePromise.catch(() => {});
 
 	// Independent discoveries that depend only on cwd/agentDir — kicked off in parallel and awaited
@@ -889,7 +898,29 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		return { ttsrManager, rulebookRules, alwaysApplyRules };
 	});
 
-	const contextFiles = await contextFilesPromise;
+	// Resolve contextFiles up-front (it's needed before tool creation). The agentsMd / workspace tree
+	// scans are slowest on large repos and we MUST NOT block startup on them — race them against a
+	// short deadline. On timeout we forward `undefined` to ToolSession; buildSystemPromptInternal will
+	// re-race them through its own withDeadline path, and subagents will scan independently (still
+	// cheaper than an unbounded parent hang). Background work continues so caches still warm.
+	const STARTUP_SCAN_DEADLINE_MS = 5000;
+	const raceWithDeadline = <T>(name: string, work: Promise<T>): Promise<T | undefined> =>
+		Promise.race([
+			work,
+			Bun.sleep(STARTUP_SCAN_DEADLINE_MS).then(() => {
+				logger.warn("Startup scan exceeded deadline; deferring to system prompt fallback", {
+					name,
+					timeoutMs: STARTUP_SCAN_DEADLINE_MS,
+					cwd,
+				});
+				return undefined;
+			}),
+		]);
+	const [contextFiles, resolvedAgentsMdSearch, resolvedWorkspaceTree] = await Promise.all([
+		contextFilesPromise,
+		raceWithDeadline("buildAgentsMdSearch", agentsMdSearchPromise),
+		raceWithDeadline("buildWorkspaceTree", workspaceTreePromise),
+	]);
 
 	let agent: Agent;
 	let session!: AgentSession;
@@ -973,6 +1004,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			},
 			skipPythonPreflight: options.skipPythonPreflight,
 			contextFiles,
+			agentsMdSearch: resolvedAgentsMdSearch,
+			workspaceTree: resolvedWorkspaceTree,
 			skills,
 			eventBus,
 			outputSchema: options.outputSchema,
@@ -1637,6 +1670,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			presencePenalty: settings.get("presencePenalty") >= 0 ? settings.get("presencePenalty") : undefined,
 			repetitionPenalty: settings.get("repetitionPenalty") >= 0 ? settings.get("repetitionPenalty") : undefined,
 			serviceTier: initialServiceTier,
+			hideThinkingSummary: settings.get("hideThinkingBlock"),
 			kimiApiFormat: settings.get("providers.kimiApiFormat") ?? "anthropic",
 			preferWebsockets: preferOpenAICodexWebsockets,
 			getToolContext: tc => toolContextStore.getContext(tc),
