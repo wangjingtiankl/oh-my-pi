@@ -6,7 +6,7 @@
 
 import path from "node:path";
 import type { AgentEvent, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
-import { logger, prompt, untilAborted } from "@oh-my-pi/pi-utils";
+import { logger, prompt } from "@oh-my-pi/pi-utils";
 import type { TSchema } from "@sinclair/typebox";
 import Ajv, { type ValidateFunction } from "ajv";
 import { ModelRegistry } from "../config/model-registry";
@@ -597,6 +597,15 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 	};
 	let hasUsage = false;
+	type SubagentResult = {
+		exitCode: number;
+		error?: string;
+		aborted?: boolean;
+		abortReason?: string;
+		durationMs: number;
+	};
+	let abortGraceTimer: NodeJS.Timeout | undefined;
+	const { promise: forceFinishPromise, resolve: forceFinish } = Promise.withResolvers<SubagentResult>();
 
 	const requestAbort = (reason: AbortReason) => {
 		if (abortSent) {
@@ -631,11 +640,25 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	const resetIdleTimer = () => {
 		lastProgressMs = Date.now();
 		if (idleTimer) clearTimeout(idleTimer);
+		if (abortGraceTimer) {
+			clearTimeout(abortGraceTimer);
+			abortGraceTimer = undefined;
+		}
 		if (idleTimeoutMs === undefined) return;
 		idleTimer = setTimeout(() => {
 			const idleDuration = Date.now() - lastProgressMs;
 			if (idleDuration >= idleTimeoutMs) {
 				requestAbort("terminate");
+				abortGraceTimer = setTimeout(() => {
+					if (!resolved) {
+						forceFinish({
+							exitCode: 1,
+							aborted: true,
+							abortReason: "subprocess-idle-timeout",
+							durationMs: Date.now() - startTime,
+						});
+					}
+				}, 30_000).unref();
 			}
 		}, idleTimeoutMs);
 	};
@@ -1195,11 +1218,16 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			}
 			if (activeSession) {
 				const session = activeSession;
-				activeSession = null;
 				try {
-					await untilAborted(AbortSignal.timeout(5000), () => session.dispose());
+					await Promise.race([
+						session.dispose(),
+						new Promise((_, reject) => {
+							setTimeout(() => reject(new Error("Session dispose timed out after 10s")), 10_000);
+						}),
+					]);
 				} catch {
 					// Ignore cleanup errors
+					logger.warn("Session dispose timed out after 10s", { id });
 				}
 			}
 		}
@@ -1213,10 +1241,11 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		};
 	};
 
-	const done = await runSubagent();
+	const done = await Promise.race([runSubagent(), forceFinishPromise]);
 	resolved = true;
 	listenerController.abort();
 	if (idleTimer) clearTimeout(idleTimer);
+	if (abortGraceTimer) clearTimeout(abortGraceTimer);
 
 	if (progressTimeoutId) {
 		clearTimeout(progressTimeoutId);
