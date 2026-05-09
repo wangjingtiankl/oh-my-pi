@@ -10,6 +10,11 @@ export interface HistoryEntry {
 	cwd?: string;
 }
 
+export interface FrequentEntry {
+	prompt: string;
+	count: number;
+}
+
 type HistoryRow = {
 	id: number;
 	prompt: string;
@@ -63,6 +68,7 @@ export class HistoryStorage {
 	#recentStmt: Statement;
 	#searchStmt: Statement;
 	#lastPromptStmt: Statement;
+	#frequentStmt: Statement;
 
 	// In-memory cache of last prompt to avoid sync DB reads on add
 	#lastPromptCache: string | null = null;
@@ -115,6 +121,9 @@ CREATE TRIGGER IF NOT EXISTS history_ai AFTER INSERT ON history BEGIN
 		this.#lastPromptStmt = this.#db.prepare("SELECT prompt FROM history ORDER BY id DESC LIMIT 1");
 
 		this.#insertRowStmt = this.#db.prepare("INSERT INTO history (prompt, cwd) VALUES (?, ?)");
+		this.#frequentStmt = this.#db.prepare(
+			"SELECT prompt, COUNT(*) as cnt FROM history WHERE LENGTH(prompt) <= ? GROUP BY prompt ORDER BY cnt DESC, MAX(created_at) DESC LIMIT ?",
+		);
 
 		const last = this.#lastPromptStmt.get() as { prompt?: string } | undefined;
 		this.#lastPromptCache = last?.prompt ?? null;
@@ -159,6 +168,20 @@ CREATE TRIGGER IF NOT EXISTS history_ai AFTER INSERT ON history BEGIN
 			return rows.map(row => this.#toEntry(row));
 		} catch (error) {
 			logger.error("HistoryStorage getRecent failed", { error: String(error) });
+			return [];
+		}
+	}
+
+	getFrequent(maxLength: number, limit: number): FrequentEntry[] {
+		const safeLimit = this.#normalizeLimit(limit);
+		if (safeLimit === 0) return [];
+		if (maxLength <= 0) return [];
+
+		try {
+			const rows = this.#frequentStmt.all(maxLength, safeLimit) as { prompt: string; cnt: number }[];
+			return rows.map(row => ({ prompt: row.prompt, count: row.cnt }));
+		} catch (error) {
+			logger.error("HistoryStorage getFrequent failed", { error: String(error) });
 			return [];
 		}
 	}

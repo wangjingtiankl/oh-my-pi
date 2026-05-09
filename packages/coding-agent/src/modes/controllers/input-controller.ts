@@ -4,7 +4,9 @@ import { sanitizeText } from "@oh-my-pi/pi-natives";
 import type { AutocompleteProvider, SlashCommand } from "@oh-my-pi/pi-tui";
 import { $env } from "@oh-my-pi/pi-utils";
 import { settings } from "../../config/settings";
+import { FrequentPromptAutocompleteProvider } from "../../modes/frequent-prompt-autocomplete";
 import { createPromptActionAutocompleteProvider } from "../../modes/prompt-action-autocomplete";
+
 import { theme } from "../../modes/theme/theme";
 import type { InteractiveModeContext } from "../../modes/types";
 import type { AgentSessionEvent } from "../../session/agent-session";
@@ -588,7 +590,11 @@ export class InputController {
 	}
 
 	createAutocompleteProvider(commands: SlashCommand[], basePath: string): AutocompleteProvider {
-		return createPromptActionAutocompleteProvider({
+		// Configure editor from settings
+		this.ctx.editor.setFrequentPromptMaxLength(this.ctx.settings.get("frequentPrompt.maxPromptLength"));
+		this.ctx.editor.setFrequentPromptMinChars(this.ctx.settings.get("frequentPrompt.minChars"));
+
+		const inner = createPromptActionAutocompleteProvider({
 			commands,
 			basePath,
 			keybindings: this.ctx.keybindings,
@@ -600,6 +606,7 @@ export class InputController {
 			moveCursorToLineStart: () => this.ctx.editor.moveToLineStart(),
 			moveCursorToLineEnd: () => this.ctx.editor.moveToLineEnd(),
 		});
+		return new FrequentPromptAutocompleteProvider(inner);
 	}
 
 	/** Copy the current editor line to the system clipboard. */

@@ -355,6 +355,8 @@ export class Editor implements Component, Focusable {
 	#autocompletePrefix: string = "";
 	#autocompleteRequestId: number = 0;
 	#autocompleteMaxVisible: number = 5;
+	#frequentPromptMaxLength = 200;
+	#frequentPromptMinChars = 3;
 	onAutocompleteUpdate?: () => void;
 
 	// Paste tracking for large pastes
@@ -384,7 +386,9 @@ export class Editor implements Component, Focusable {
 
 	// Custom top border (for status line integration)
 	#topBorderContent?: EditorTopBorder;
+
 	#borderVisible = true;
+	#triggerAutocompleteTimeout?: NodeJS.Timeout;
 
 	constructor(theme: EditorTheme) {
 		this.#theme = theme;
@@ -456,6 +460,14 @@ export class Editor implements Component, Focusable {
 		}
 	}
 
+	setFrequentPromptMaxLength(length: number): void {
+		this.#frequentPromptMaxLength = Math.max(50, Math.min(5000, Math.floor(length)));
+	}
+
+	setFrequentPromptMinChars(chars: number): void {
+		this.#frequentPromptMinChars = Math.max(2, Math.min(20, Math.floor(chars)));
+	}
+
 	setHistoryStorage(storage: HistoryStorage): void {
 		this.#historyStorage = storage;
 		const recent = storage.getRecent(100);
@@ -478,8 +490,9 @@ export class Editor implements Component, Focusable {
 			this.#history.pop();
 		}
 
+		// Persist to SQLite (skip long prompts — they're not useful for frequent-prompt suggestions)
 		const stor = this.#historyStorage;
-		if (stor) {
+		if (stor && trimmed.length <= this.#frequentPromptMaxLength) {
 			stor.add(trimmed, getProjectDir()).catch(error => {
 				logger.error("HistoryStorage add failed", { error: String(error) });
 			});
@@ -1029,8 +1042,11 @@ export class Editor implements Component, Focusable {
 					}
 					// Don't return - fall through to submission logic
 				}
-				// If Enter was pressed on a file path, apply completion
-				else if (kb.matches(data, "tui.input.submit") || data === "\n") {
+				// If Enter was pressed on a file path (@ prefix), apply completion
+				else if (
+					(kb.matches(data, "tui.input.submit") || data === "\n") &&
+					this.#autocompletePrefix.startsWith("@")
+				) {
 					const selected = this.#autocompleteList.getSelectedItem();
 					if (selected && this.#autocompleteProvider) {
 						const result = this.#autocompleteProvider.applyCompletion(
@@ -1053,7 +1069,10 @@ export class Editor implements Component, Focusable {
 
 						result.onApplied?.();
 					}
-					return;
+				}
+				// Enter on regular text (frequent prompts): cancel autocomplete, submit as-is
+				else {
+					this.#cancelAutocomplete();
 				}
 			}
 			// For other keys (like regular typing), DON'T return here
@@ -1499,6 +1518,14 @@ export class Editor implements Component, Focusable {
 				else if (textBeforeCursor.match(/#[^\s#]*$/)) {
 					this.#tryTriggerAutocomplete();
 				}
+				// General text: debounce to avoid lag on fast typing
+				else if (textBeforeCursor.trim().length >= this.#frequentPromptMinChars) {
+					this.#debouncedTriggerAutocomplete();
+				}
+			}
+			// Non-ASCII chars (Chinese, emoji, punctuation, space): debounce
+			else if (this.#state.cursorCol >= this.#frequentPromptMinChars) {
+				this.#debouncedTriggerAutocomplete();
 			}
 		} else {
 			this.#debouncedUpdateAutocomplete();
@@ -1672,6 +1699,10 @@ export class Editor implements Component, Focusable {
 			else if (textBeforeCursor.match(/#[^\s#]*$/)) {
 				this.#tryTriggerAutocomplete();
 			}
+			// General text: min chars
+			else if (textBeforeCursor.trim().length >= this.#frequentPromptMinChars) {
+				this.#tryTriggerAutocomplete();
+			}
 		}
 	}
 
@@ -1824,9 +1855,12 @@ export class Editor implements Component, Focusable {
 			} else if (textBeforeCursor.match(/#[^\s#]*$/)) {
 				this.#tryTriggerAutocomplete();
 			}
+			// General text: min chars
+			else if (textBeforeCursor.trim().length >= this.#frequentPromptMinChars) {
+				this.#tryTriggerAutocomplete();
+			}
 		}
 	}
-
 	#matchesTransientUndoSnapshot(
 		snapshot: EditorState,
 		transientText: string,
@@ -2142,6 +2176,10 @@ export class Editor implements Component, Focusable {
 			else if (textBeforeCursor.match(/#[^\s#]*$/)) {
 				this.#tryTriggerAutocomplete();
 			}
+			// General text: min chars
+			else if (textBeforeCursor.trim().length >= this.#frequentPromptMinChars) {
+				this.#tryTriggerAutocomplete();
+			}
 		}
 	}
 
@@ -2393,11 +2431,11 @@ export class Editor implements Component, Focusable {
 		prefix: string,
 		items: Array<{ value: string; label: string; description?: string }>,
 	): SelectList {
-		// Layout options prepared for future SelectList enhancements (e.g., for slash commands)
-		const layout = prefix.startsWith("/") ? SLASH_COMMAND_SELECT_LIST_LAYOUT : undefined;
-		// TODO: Pass layout to SelectList when constructor is updated to support it
-		void layout; // Use layout variable to avoid lint warnings
-		return new SelectList(items, this.#autocompleteMaxVisible, this.#theme.selectList);
+		// For slash commands, use a compact layout; for frequent prompts, expand to fit content
+		const layout: SelectListLayoutOptions = prefix.startsWith("/")
+			? SLASH_COMMAND_SELECT_LIST_LAYOUT
+			: { minPrimaryColumnWidth: 24, maxPrimaryColumnWidth: 80 };
+		return new SelectList(items, this.#autocompleteMaxVisible, this.#theme.selectList, layout);
 	}
 
 	#handleTabCompletion(): void {
@@ -2528,6 +2566,16 @@ https://github.com/EsotericSoftware/spine-runtimes/actions/runs/19536643416/job/
 			this.#updateAutocomplete();
 			this.#autocompleteTimeout = undefined;
 		}, 100);
+	}
+
+	#debouncedTriggerAutocomplete(): void {
+		if (this.#triggerAutocompleteTimeout) {
+			clearTimeout(this.#triggerAutocompleteTimeout);
+		}
+		this.#triggerAutocompleteTimeout = setTimeout(() => {
+			this.#triggerAutocompleteTimeout = undefined;
+			this.#tryTriggerAutocomplete();
+		}, 150);
 	}
 
 	#clearAutocompleteTimeout(): void {

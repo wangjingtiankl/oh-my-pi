@@ -831,6 +831,70 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	// Frequent prompt suggestions
+	"frequentPrompt.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "interaction",
+			label: "Frequent Prompt Suggestions",
+			description: "Show frequently used prompts as autocomplete suggestions while typing",
+		},
+	},
+	"frequentPrompt.minChars": {
+		type: "number",
+		default: 3,
+		ui: {
+			tab: "interaction",
+			label: "Min Chars to Trigger",
+			description: "Minimum characters typed before frequent prompt suggestions appear (2-10)",
+			options: [
+				{ value: "2", label: "2 chars" },
+				{ value: "3", label: "3 chars" },
+				{ value: "4", label: "4 chars" },
+				{ value: "5", label: "5 chars" },
+				{ value: "6", label: "6 chars" },
+				{ value: "8", label: "8 chars" },
+				{ value: "10", label: "10 chars" },
+			],
+		},
+	},
+	"frequentPrompt.maxPromptLength": {
+		type: "number",
+		default: 200,
+		ui: {
+			tab: "interaction",
+			label: "Max Saved Prompt Length",
+			description: "Prompts longer than this won't be saved for frequent-prompt suggestions (50-1000)",
+			options: [
+				{ value: "50", label: "50 chars" },
+				{ value: "100", label: "100 chars" },
+				{ value: "150", label: "150 chars" },
+				{ value: "200", label: "200 chars" },
+				{ value: "300", label: "300 chars" },
+				{ value: "500", label: "500 chars" },
+				{ value: "1000", label: "1000 chars" },
+			],
+		},
+	},
+	"frequentPrompt.maxResults": {
+		type: "number",
+		default: 8,
+		ui: {
+			tab: "interaction",
+			label: "Max Suggestions",
+			description: "Maximum number of frequent prompt suggestions to show (3-20)",
+			options: [
+				{ value: "3", label: "3 items" },
+				{ value: "5", label: "5 items" },
+				{ value: "8", label: "8 items" },
+				{ value: "10", label: "10 items" },
+				{ value: "15", label: "15 items" },
+				{ value: "20", label: "20 items" },
+			],
+		},
+	},
+
 	"startup.quiet": {
 		type: "boolean",
 		default: false,
