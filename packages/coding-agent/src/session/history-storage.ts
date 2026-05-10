@@ -122,7 +122,7 @@ CREATE TRIGGER IF NOT EXISTS history_ai AFTER INSERT ON history BEGIN
 
 		this.#insertRowStmt = this.#db.prepare("INSERT INTO history (prompt, cwd) VALUES (?, ?)");
 		this.#frequentStmt = this.#db.prepare(
-			"SELECT prompt, COUNT(*) as cnt FROM history WHERE LENGTH(prompt) <= ? GROUP BY prompt ORDER BY cnt DESC, MAX(created_at) DESC LIMIT ?",
+			"SELECT prompt, COUNT(*) as cnt FROM history WHERE LENGTH(prompt) <= ? GROUP BY prompt ORDER BY MAX(created_at) DESC LIMIT ?",
 		);
 
 		const last = this.#lastPromptStmt.get() as { prompt?: string } | undefined;
@@ -245,7 +245,7 @@ END;
 	#normalizeLimit(limit: number): number {
 		if (!Number.isFinite(limit)) return 0;
 		const clamped = Math.max(0, Math.floor(limit));
-		return Math.min(clamped, 1000);
+		return Math.min(clamped, 5000);
 	}
 
 	#buildFtsQuery(query: string): string | null {

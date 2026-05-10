@@ -38,7 +38,7 @@ function fuzzyScore(query: string, target: string): number {
 	return Math.max(1, 40 - gaps * 5);
 }
 
-const FREQUENT_PROMPT_CACHE_SIZE = 200;
+const FREQUENT_PROMPT_CACHE_SIZE = 2000;
 
 export class FrequentPromptAutocompleteProvider implements AutocompleteProvider {
 	#inner: AutocompleteProvider;
