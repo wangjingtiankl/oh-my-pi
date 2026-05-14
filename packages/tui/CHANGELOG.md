@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+
+- Fixed StdinBuffer flushing incomplete escape sequences (e.g. split DA1 responses) as complete sequences, preventing printable characters from leaking into the input field
 
 ## [14.5.7] - 2026-04-29
 

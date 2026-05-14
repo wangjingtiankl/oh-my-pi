@@ -118,14 +118,14 @@ describe("StdinBuffer", () => {
 			expect(emittedSequences).toEqual(["\x1b[<35;20;5m"]);
 		});
 
-		it("should flush incomplete sequence after timeout", async () => {
+		it("should discard incomplete sequence after timeout", async () => {
 			processInput("\x1b[<35");
 			expect(emittedSequences).toEqual([]);
 
-			// Wait for timeout
+			// Wait for timeout — should discard, not emit partial data
 			await Bun.sleep(15);
 
-			expect(emittedSequences).toEqual(["\x1b[<35"]);
+			expect(emittedSequences).toEqual([]);
 		});
 	});
 
@@ -293,10 +293,10 @@ describe("StdinBuffer", () => {
 	});
 
 	describe("Flush", () => {
-		it("should flush incomplete sequences", () => {
+		it("should discard incomplete sequences on flush", () => {
 			processInput("\x1b[<35");
 			const flushed = buffer.flush();
-			expect(flushed).toEqual(["\x1b[<35"]);
+			expect(flushed).toEqual([]);
 			expect(buffer.getBuffer()).toBe("");
 		});
 
@@ -305,14 +305,14 @@ describe("StdinBuffer", () => {
 			expect(flushed).toEqual([]);
 		});
 
-		it("should emit flushed data via timeout", async () => {
+		it("should not emit partial escape data via timeout", async () => {
 			processInput("\x1b[<35");
 			expect(emittedSequences).toEqual([]);
 
-			// Wait for timeout to flush
+			// Wait for timeout — partial sequence should be discarded
 			await Bun.sleep(15);
 
-			expect(emittedSequences).toEqual(["\x1b[<35"]);
+			expect(emittedSequences).toEqual([]);
 		});
 	});
 

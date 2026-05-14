@@ -20,6 +20,8 @@ export interface DirectoryTree {
 	rendered: string;
 	truncated: boolean;
 	totalLines: number;
+	/** True when the directory has no entries beyond the root itself. */
+	isEmpty: boolean;
 }
 
 export interface WorkspaceTree extends DirectoryTree {
@@ -195,6 +197,7 @@ function assembleTree(rootPath: string, entries: readonly GlobMatch[], opts: Ass
 		rendered: formatLines(lines),
 		truncated: truncated || elidedCount > 0,
 		totalLines: lines.length,
+		isEmpty: root.children.length === 0,
 	};
 }
 
@@ -282,5 +285,6 @@ function emptyTree(rootPath: string): DirectoryTree {
 		rendered: "",
 		truncated: false,
 		totalLines: 0,
+		isEmpty: true,
 	};
 }

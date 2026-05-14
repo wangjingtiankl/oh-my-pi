@@ -408,6 +408,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 			truncated: false,
 			totalLines: 0,
 			agentsMdFiles: [],
+			isEmpty: true,
 		} satisfies WorkspaceTree,
 	};
 

@@ -240,6 +240,7 @@ describe("system Handlebars prompt templates", () => {
 					truncated: false,
 					totalLines: 2,
 					agentsMdFiles: [],
+					isEmpty: false,
 				},
 			});
 
@@ -267,6 +268,7 @@ describe("system Handlebars prompt templates", () => {
 					truncated: true,
 					totalLines: 2,
 					agentsMdFiles: ["packages/coding-agent/AGENTS.md"],
+					isEmpty: false,
 				},
 			});
 

@@ -1619,7 +1619,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		}
 		throwIfAborted(signal);
 
-		const output = tree.totalLines <= 1 ? "(empty directory)" : tree.rendered;
+		const output = tree.isEmpty ? "(empty directory)" : tree.rendered;
 		const truncation = truncateHead(output, { maxLines: Number.MAX_SAFE_INTEGER });
 		const details: ReadToolDetails = {
 			isDirectory: true,

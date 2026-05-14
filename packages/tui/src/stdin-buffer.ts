@@ -360,6 +360,17 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 			return [];
 		}
 
+		// If the buffer contains a partial escape sequence (starts with ESC, >1 byte,
+		// not a complete sequence), discard it rather than emitting it as a "complete"
+		// sequence.  This prevents split terminal responses like
+		// "\x1b[?1;2;4;8;16" (DA1 response arriving in chunks) from having their
+		// remaining printable characters leak through to the input field.
+		// Single-byte ESC needs to be preserved as the Escape key.
+		if (this.#buffer.length > 1 && this.#buffer.startsWith(ESC) && isCompleteSequence(this.#buffer) !== "complete") {
+			this.#buffer = "";
+			return [];
+		}
+
 		const sequences = [this.#buffer];
 		this.#buffer = "";
 		return sequences;
