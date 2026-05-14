@@ -2,228 +2,351 @@ import { describe, expect, it } from "bun:test";
 import { parseEvalInput } from "../../src/eval/parse";
 
 describe("parseEvalInput", () => {
-	it("parses a single header cell with title shorthand and t timeout", () => {
-		const result = parseEvalInput(`===== py:"setup" t:15s =====
+	it("parses a single cell with title and timeout", () => {
+		const result = parseEvalInput(`*** Cell py:"setup" t:10s
 print("hi")
 `);
-
-		expect(result.cells).toEqual([
-			{
-				index: 0,
-				title: "setup",
-				code: 'print("hi")',
-				language: "python",
-				languageOrigin: "header",
-				timeoutMs: 15_000,
-				reset: false,
-			},
-		]);
-	});
-
-	it("treats bare rst as a per-language kernel wipe for that cell", () => {
-		const result = parseEvalInput(`===== py rst id:"bootstrap" =====
-import json
-===== js rst =====
-const x = 1;
-`);
-
-		expect(result.cells.map(cell => [cell.language, cell.reset, cell.title])).toEqual([
-			["python", true, "bootstrap"],
-			["js", true, undefined],
-		]);
-	});
-
-	it("inherits language across consecutive cells when omitted", () => {
-		const result = parseEvalInput(`===== js =====
-const a = 1;
-===== =====
-const b = a + 1;
-`);
-
-		expect(result.cells.map(cell => [cell.language, cell.languageOrigin, cell.code, cell.reset])).toEqual([
-			["js", "header", "const a = 1;", false],
-			["js", "header", "const b = a + 1;", false],
-		]);
-	});
-
-	it("accepts asymmetric bar runs and case-insensitive language tokens", () => {
-		const result = parseEvalInput(`===== TypeScript ======
-const a = 1;
-====== IPython =====
-print("ipy")
-`);
-
-		expect(result.cells.map(cell => [cell.language, cell.languageOrigin])).toEqual([
-			["js", "header"],
-			["python", "header"],
-		]);
-	});
-
-	it("uses canonical id and t attributes, with explicit attrs winning over positional", () => {
-		const result = parseEvalInput(`===== py 5s some words t:2m id:"explicit win" =====
-print(1)
-`);
-
+		expect(result.cells).toHaveLength(1);
 		expect(result.cells[0]).toMatchObject({
-			title: "explicit win",
-			timeoutMs: 120_000,
+			index: 0,
+			title: "setup",
 			language: "python",
+			languageOrigin: "header",
+			timeoutMs: 10_000,
+			reset: false,
+			code: 'print("hi")',
 		});
 	});
 
-	it("accepts fallback aliases for id, t, and rst keys", () => {
-		const idAliases = ["title", "name", "cell", "file", "label"];
-		for (const key of idAliases) {
-			const result = parseEvalInput(`===== py ${key}:"alpha" =====\nprint(1)\n`);
-			expect(result.cells[0].title).toBe("alpha");
-		}
+	it("treats rst as a per-cell kernel wipe", () => {
+		const result = parseEvalInput(`*** Cell py:"bootstrap"
+import json
 
-		const timeoutAliases = ["timeout", "duration", "time"];
-		for (const key of timeoutAliases) {
-			const result = parseEvalInput(`===== py ${key}:2m =====\nprint(1)\n`);
-			expect(result.cells[0].timeoutMs).toBe(120_000);
-		}
-
-		const result = parseEvalInput(`===== py reset:true =====\nprint(1)\n`);
-		expect(result.cells[0].reset).toBe(true);
+*** Cell js:"" rst
+const x = 1;
+`);
+		expect(result.cells).toHaveLength(2);
+		expect(result.cells[0].reset).toBe(false);
+		expect(result.cells[1].reset).toBe(true);
+		expect(result.cells[1].language).toBe("js");
 	});
 
-	it("first occurrence wins when canonical and alias collide", () => {
-		const canonicalFirst = parseEvalInput(`===== py id:"canon" title:"alias" =====
-print(1)
+	it("accepts case-insensitive language tokens (lenient)", () => {
+		const result = parseEvalInput(`*** Cell JS:""
+const a = 1;
+*** Cell PY:""
+print("py")
 `);
-		const aliasFirst = parseEvalInput(`===== py title:"alias" id:"canon" =====
-print(1)
-`);
-
-		expect(canonicalFirst.cells[0].title).toBe("canon");
-		expect(aliasFirst.cells[0].title).toBe("alias");
+		expect(result.cells).toHaveLength(2);
+		expect(result.cells[0].language).toBe("js");
+		expect(result.cells[1].language).toBe("python");
 	});
 
 	it("parses millisecond, second, and minute durations", () => {
-		const result = parseEvalInput(`===== py t:500ms =====
+		const result = parseEvalInput(`*** Cell py:"a" t:500ms
 a = 1
-===== py t:5 =====
+*** Cell py:"b" t:5
 a = 2
-===== py t:2m =====
+*** Cell py:"c" t:2m
 a = 3
 `);
-
-		expect(result.cells.map(cell => cell.timeoutMs)).toEqual([500, 5_000, 120_000]);
+		expect(result.cells.map(c => c.timeoutMs)).toEqual([500, 5000, 120_000]);
 	});
 
-	it("treats unrecognized header tokens as a title and inherits the language", () => {
-		const result = parseEvalInput(`===== ruby =====
-puts "no"
-`);
-
-		expect(result.cells[0]).toMatchObject({
-			title: "ruby",
-			code: 'puts "no"',
-			language: "python",
-			languageOrigin: "default",
-		});
-	});
-
-	it("joins multiple positional title fragments with spaces", () => {
-		const result = parseEvalInput(`===== py compute totals =====
-print(1)
-`);
-
-		expect(result.cells[0].title).toBe("compute totals");
-	});
-
-	it("accepts back-to-back header cells without blank separators", () => {
-		const result = parseEvalInput(`===== py id:"a" =====
-print("a")
-===== py id:"b" =====
-print("b")
-`);
-
-		expect(result.cells.map(cell => [cell.title, cell.code])).toEqual([
-			["a", 'print("a")'],
-			["b", 'print("b")'],
-		]);
-	});
-
-	it("wraps bare code with no headers in a single implicit cell", () => {
-		const result = parseEvalInput(`print("hello")
-print("world")
-`);
-
-		expect(result.cells).toEqual([
-			{
-				index: 0,
-				title: undefined,
-				code: 'print("hello")\nprint("world")',
-				language: "python",
-				languageOrigin: "default",
-				timeoutMs: 30_000,
-				reset: false,
-			},
-		]);
-	});
-
-	it("strips blank lines between cells from the preceding cell's code", () => {
-		const result = parseEvalInput(`===== js =====
+	it("preserves blank lines inside the cell body", () => {
+		const result = parseEvalInput(`*** Cell js:""
 const x = 1;
 
-===== =====
 const y = 2;
 `);
-
-		expect(result.cells.map(cell => [cell.language, cell.languageOrigin, cell.code])).toEqual([
-			["js", "header", "const x = 1;"],
-			["js", "header", "const y = 2;"],
-		]);
+		expect(result.cells).toHaveLength(1);
+		expect(result.cells[0].code).toBe("const x = 1;\n\nconst y = 2;");
 	});
 
-	it("accepts an empty header introducing a default cell with no info", () => {
-		const result = parseEvalInput(`=====
-print("still typing")
-`);
+	it("treats blank lines between cells as separators, not code", () => {
+		const result = parseEvalInput(`*** Cell py:""
+print("a")
 
+
+*** Cell py:""
+print("b")
+`);
+		expect(result.cells).toHaveLength(2);
+		expect(result.cells[0].code).toBe('print("a")');
+		expect(result.cells[1].code).toBe('print("b")');
+	});
+
+	it("falls back to language sniffing when the header has no recognized language", () => {
+		// Bare `ruby` doesn't match LANG_TITLE, but the parser is lenient and
+		// falls back to body sniffing.
+		const result = parseEvalInput(`*** Cell ruby:"x"
+const x = 1;
+`);
+		expect(result.cells).toHaveLength(1);
+		expect(result.cells[0].languageOrigin).toBe("default");
+		expect(result.cells[0].language).toBe("js");
+	});
+
+	it("accepts `**Cell` (two stars) as well as `***Cell`", () => {
+		const result = parseEvalInput(`**Cell py:""
+print(1)
+`);
+		expect(result.cells).toHaveLength(1);
+		expect(result.cells[0].language).toBe("python");
+	});
+
+	it("implicitly closes a cell when a new *** Cell appears without *** End", () => {
+		const result = parseEvalInput(`*** Cell py:""
+print("a")
+*** Cell js:""
+const x = 1;
+`);
+		expect(result.cells).toHaveLength(2);
+		expect(result.cells[0].code).toBe('print("a")');
+		expect(result.cells[1].code).toBe("const x = 1;");
+	});
+
+	it("tolerates `*** End` as an optional cell terminator (GPT quirk)", () => {
+		const result = parseEvalInput(`*** Cell py:""
+print(1)
+*** End
+*** Cell js:""
+const x = 1;
+*** End
+`);
+		expect(result.cells).toHaveLength(2);
+		expect(result.cells[0].code).toBe("print(1)");
+		expect(result.cells[1].code).toBe("const x = 1;");
+	});
+
+	it("ignores anything trailing `*** End` (leniency)", () => {
+		const result = parseEvalInput(`*** Cell py:""
+print(1)
+*** End py
+`);
+		expect(result.cells).toHaveLength(1);
+		expect(result.cells[0].code).toBe("print(1)");
+	});
+
+	it("accepts long-form language aliases (Python, JavaScript, TypeScript)", () => {
+		const result = parseEvalInput(`*** Cell Python:""
+print(1)
+*** Cell JavaScript:""
+const a = 1;
+*** Cell TypeScript:""
+const b = 2;
+`);
+		expect(result.cells.map(c => c.language)).toEqual(["python", "js", "js"]);
+	});
+
+	it("implicitly closes the final cell at EOF when *** End is missing", () => {
+		const result = parseEvalInput(`*** Cell py:""
+print(1)
+`);
+		expect(result.cells).toHaveLength(1);
+		expect(result.cells[0].code).toBe("print(1)");
+	});
+
+	it("treats bare code without any *** Cell as a single implicit cell", () => {
+		const result = parseEvalInput(`def greet():\n    print('hi')\ngreet()\n`);
 		expect(result.cells).toHaveLength(1);
 		expect(result.cells[0]).toMatchObject({
-			code: 'print("still typing")',
-			language: "python",
 			languageOrigin: "default",
-			reset: false,
+			language: "python",
+			code: "def greet():\n    print('hi')\ngreet()",
 		});
 	});
 
-	it("ignores unknown attribute keys without erroring", () => {
-		const result = parseEvalInput(`===== py mystery:123 id:"ok" =====
-print(1)
-`);
-
-		expect(result.cells[0]).toMatchObject({ title: "ok", language: "python" });
-	});
-
-	it("rejects an invalid rst value", () => {
-		expect(() =>
-			parseEvalInput(`===== py rst:maybe =====
-print(1)
-`),
-		).toThrow("invalid rst value");
-	});
-
-	it("rejects an invalid t value", () => {
-		expect(() =>
-			parseEvalInput(`===== py t:forever =====
-print(1)
-`),
-		).toThrow("invalid duration");
-	});
-
-	it("does not treat lines that start with equals but have no closing bar as a header", () => {
-		const result = parseEvalInput(`===== py =====
-x = 1
-===== not a header
-y = 2
-`);
-
+	it("strips a markdown code fence wrapper and uses its language tag", () => {
+		const result = parseEvalInput("```js\nconst x = 1;\n```\n");
 		expect(result.cells).toHaveLength(1);
-		expect(result.cells[0].code).toBe("x = 1\n===== not a header\ny = 2");
+		expect(result.cells[0]).toMatchObject({
+			language: "js",
+			languageOrigin: "header",
+			code: "const x = 1;",
+		});
+	});
+
+	it("rejects invalid duration", () => {
+		expect(() =>
+			parseEvalInput(`*** Cell py:"" t:forever
+print(1)
+`),
+		).toThrow(/invalid duration/);
+	});
+
+	it("supports titles with embedded spaces", () => {
+		const result = parseEvalInput(`*** Cell py:"load and validate config"
+print(1)
+`);
+		expect(result.cells).toHaveLength(1);
+		expect(result.cells[0].title).toBe("load and validate config");
+	});
+
+	it('treats empty title (`py:""`) as no title', () => {
+		const result = parseEvalInput(`*** Cell py:""
+print(1)
+`);
+		expect(result.cells).toHaveLength(1);
+		expect(result.cells[0].title).toBeUndefined();
+		expect(result.cells[0].language).toBe("python");
+	});
+
+	it("accepts bare language token without title (lenient form)", () => {
+		// Parser is more permissive than the lark; bare `py` is accepted
+		// even though the canonical form is `py:"title"`.
+		const result = parseEvalInput(`*** Cell py
+print(1)
+`);
+		expect(result.cells).toHaveLength(1);
+		expect(result.cells[0].language).toBe("python");
+		expect(result.cells[0].title).toBeUndefined();
+	});
+
+	describe("attribute leniency (accepted but not advertised)", () => {
+		it("accepts id aliases (title/name/cell/file/label)", () => {
+			const aliases = ["title", "name", "cell", "file", "label"];
+			for (const alias of aliases) {
+				const result = parseEvalInput(`*** Cell py ${alias}:"hi"\nprint(1)\n`);
+				expect(result.cells[0].title).toBe("hi");
+			}
+		});
+
+		it("accepts t aliases (timeout/duration/time)", () => {
+			const aliases = ["timeout", "duration", "time"];
+			for (const alias of aliases) {
+				const result = parseEvalInput(`*** Cell py ${alias}:5s\nprint(1)\n`);
+				expect(result.cells[0].timeoutMs).toBe(5000);
+			}
+		});
+
+		it("accepts `reset` as an alias for `rst`", () => {
+			const result = parseEvalInput(`*** Cell py reset\nprint(1)\n`);
+			expect(result.cells[0].reset).toBe(true);
+		});
+
+		it("accepts `rst:true|false|1|0|yes|no|on|off`", () => {
+			for (const v of ["true", "1", "yes", "on"]) {
+				const r = parseEvalInput(`*** Cell py rst:${v}\nx\n`);
+				expect(r.cells[0].reset).toBe(true);
+			}
+			for (const v of ["false", "0", "no", "off"]) {
+				const r = parseEvalInput(`*** Cell py rst:${v}\nx\n`);
+				expect(r.cells[0].reset).toBe(false);
+			}
+		});
+
+		it("rejects an invalid rst value", () => {
+			expect(() => parseEvalInput(`*** Cell py rst:maybe\nx\n`)).toThrow(/invalid rst/);
+		});
+
+		it("accepts single-quoted titles (`id:'hi'`)", () => {
+			const result = parseEvalInput(`*** Cell py id:'hello world'\nprint(1)\n`);
+			expect(result.cells[0].title).toBe("hello world");
+		});
+
+		it("accepts a bare positional duration token (e.g. `30s`)", () => {
+			const result = parseEvalInput(`*** Cell py 2m\nprint(1)\n`);
+			expect(result.cells[0].timeoutMs).toBe(120_000);
+		});
+
+		it("first occurrence wins for repeated keys (canonical or alias)", () => {
+			const result = parseEvalInput(`*** Cell py id:"first" name:"second" t:1s timeout:5s\nprint(1)\n`);
+			expect(result.cells[0].title).toBe("first");
+			expect(result.cells[0].timeoutMs).toBe(1000);
+		});
+
+		it("unclassified bare tokens accumulate as a positional title", () => {
+			const result = parseEvalInput(`*** Cell py setup phase\nprint(1)\n`);
+			expect(result.cells[0].title).toBe("setup phase");
+		});
+	});
+
+	describe("*** Abort recovery sentinel (harmony-leak mitigation)", () => {
+		it("drops the in-progress cell and stops parsing", () => {
+			const result = parseEvalInput(`*** Cell py:""
+print("a")
+*** Cell js:""
+const partial = 1;  /* contamination starts mid-cell */
+*** Abort
+*** Cell js:""
+const never_runs = 1;
+`);
+			expect(result.aborted).toBe(true);
+			expect(result.cells).toHaveLength(1);
+			expect(result.cells[0].language).toBe("python");
+			expect(result.cells[0].code).toBe('print("a")');
+		});
+
+		it("`*** End` before `*** Abort` preserves the closed cell", () => {
+			// Without `*** End`, the parser can't tell whether the cell was
+			// complete before contamination — by design, since `*** End` is
+			// optional and undocumented. Explicit `*** End` is the GPT quirk
+			// that signals "cell is closed, abort is between cells".
+			const result = parseEvalInput(`*** Cell py:""
+print("a")
+*** End
+
+*** Abort
+
+*** Cell py:""
+print("never")
+`);
+			expect(result.aborted).toBe(true);
+			expect(result.cells).toHaveLength(1);
+			expect(result.cells[0].code).toBe('print("a")');
+		});
+
+		it("implicit-cell input containing *** Abort is rejected entirely", () => {
+			const result = parseEvalInput(`print("partial")
+*** Abort
+`);
+			expect(result.aborted).toBe(true);
+			expect(result.cells).toHaveLength(0);
+		});
+
+		it("appended sentinel from harmony-leak truncation: abort flag set, prior cell dropped", () => {
+			const truncated = `*** Cell py:""\nprint("ok")\n*** Abort\n`;
+			const result = parseEvalInput(truncated);
+			expect(result.aborted).toBe(true);
+			expect(result.cells).toHaveLength(0);
+		});
+
+		it("absent sentinel: aborted is undefined (not falsely set)", () => {
+			const result = parseEvalInput(`*** Cell py:""
+print(1)
+`);
+			expect(result.aborted).toBeUndefined();
+		});
+	});
+
+	it("does not crash on stray non-marker lines between cells", () => {
+		// Regression for "null is not an object (evaluating
+		// 'BEGIN_RE.exec(lines[i])[1]')" — stray fragments must not crash.
+		// Without `*** End`, the stray junk folds into the prior cell's body;
+		// the contract for this test is just "don't crash".
+		const result = parseEvalInput(`*** Cell py:""
+print("a")
+stray junk that is not a marker
+*** Cell py:""
+print("b")
+`);
+		expect(result.aborted).toBeUndefined();
+		expect(result.cells).toHaveLength(2);
+		expect(result.cells[0].code).toContain('print("a")');
+		expect(result.cells[1].code).toBe('print("b")');
+	});
+
+	it("does not crash on trailing stray content after the final cell", () => {
+		const result = parseEvalInput(`*** Cell py:""
+print(1)
+leftover model chatter
+more junk
+`);
+		expect(result.aborted).toBeUndefined();
+		expect(result.cells).toHaveLength(1);
+		// Stray lines fold into the cell body (no terminator), which is fine —
+		// the contract is just "don't crash".
+		expect(result.cells[0].code).toContain("print(1)");
 	});
 });

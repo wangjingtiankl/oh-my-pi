@@ -33,6 +33,11 @@ async function main(): Promise<void> {
 					"bun",
 					"build",
 					"--compile",
+					"--no-compile-autoload-bunfig",
+					"--no-compile-autoload-dotenv",
+					"--no-compile-autoload-tsconfig",
+					"--no-compile-autoload-package-json",
+					"--keep-names",
 					"--define",
 					'process.env.PI_COMPILED="true"',
 					"--external",
@@ -40,6 +45,17 @@ async function main(): Promise<void> {
 					"--root",
 					"../..",
 					"./src/cli.ts",
+					// Worker entrypoints. Bun's `--compile` discovers the literal in
+					// `new Worker("…", …)` at each spawn site, but only actually
+					// emits the worker into the bunfs root when it is listed here as
+					// an explicit additional entry. Paths are relative to this
+					// script's cwd (packages/coding-agent) and the `--root` above
+					// (../..) makes them appear inside the binary at
+					// `/$bunfs/root/packages/<pkg>/src/<worker>.js`, which is
+					// exactly what the literals at the spawn sites resolve to.
+					"../stats/src/sync-worker.ts",
+					"./src/tools/browser/tab-worker-entry.ts",
+					"./src/eval/js/worker-entry.ts",
 					"--outfile",
 					"dist/omp",
 				],

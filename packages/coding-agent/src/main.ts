@@ -125,8 +125,11 @@ export interface InteractiveModeNotify {
 }
 
 export async function submitInteractiveInput(
-	mode: Pick<InteractiveMode, "markPendingSubmissionStarted" | "finishPendingSubmission" | "showError">,
-	session: Pick<AgentSession, "prompt">,
+	mode: Pick<
+		InteractiveMode,
+		"markPendingSubmissionStarted" | "finishPendingSubmission" | "showError" | "checkShutdownRequested"
+	>,
+	session: Pick<AgentSession, "prompt" | "promptCustomMessage">,
 	input: SubmittedUserInput,
 ): Promise<void> {
 	if (input.cancelled) {
@@ -138,12 +141,22 @@ export async function submitInteractiveInput(
 		if (!input.started && !mode.markPendingSubmissionStarted(input)) {
 			return;
 		}
-		await session.prompt(input.text, { images: input.images });
+		if (input.customType) {
+			await session.promptCustomMessage({
+				customType: input.customType,
+				content: input.text,
+				display: input.display ?? false,
+				attribution: "agent",
+			});
+		} else {
+			await session.prompt(input.text, { images: input.images });
+		}
 	} catch (error: unknown) {
 		const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 		mode.showError(errorMessage);
 	} finally {
 		mode.finishPendingSubmission(input);
+		await mode.checkShutdownRequested();
 	}
 }
 
@@ -638,7 +651,7 @@ export async function runRootCommand(parsed: Args, rawArgs: string[]): Promise<v
 		process.exit(0);
 	}
 
-	if (parsedArgs.mode === "rpc" && parsedArgs.fileArgs.length > 0) {
+	if ((parsedArgs.mode === "rpc" || parsedArgs.mode === "rpc-ui") && parsedArgs.fileArgs.length > 0) {
 		process.stderr.write(`${chalk.red("Error: @file arguments are not supported in RPC mode")}\n`);
 		process.exit(1);
 	}
@@ -656,13 +669,13 @@ export async function runRootCommand(parsed: Args, rawArgs: string[]): Promise<v
 
 	const cwd = getProjectDir();
 	const settingsInstance = await logger.time("settings:init", Settings.init, { cwd });
-	if (parsedArgs.mode === "rpc") {
+	if (parsedArgs.mode === "rpc" || parsedArgs.mode === "rpc-ui" || parsedArgs.mode === "acp") {
 		applyRpcDefaultSettingOverrides();
 	}
-	if (parsedArgs.noPty) {
+	if (parsedArgs.noPty || parsedArgs.mode === "rpc-ui") {
 		Bun.env.PI_NO_PTY = "1";
 	}
-	if (parsedArgs.noTitle || parsedArgs.mode === "rpc") {
+	if (parsedArgs.noTitle || parsedArgs.mode === "rpc" || parsedArgs.mode === "rpc-ui" || parsedArgs.mode === "acp") {
 		Bun.env.PI_NO_TITLE = "1";
 	}
 	const { pipedInput, fileText, fileImages } = await logger.time("prepareInitialMessage", async () => {
@@ -765,7 +778,7 @@ export async function runRootCommand(parsed: Args, rawArgs: string[]): Promise<v
 					await mgr.upgradeAllPlugins();
 					logger.debug(`Auto-upgraded ${updates.length} marketplace plugin(s)`);
 				} else {
-					logger.debug(`${updates.length} marketplace plugin update(s) available \u2014 /marketplace upgrade`);
+					logger.debug(`${updates.length} marketplace plugin update(s) available — /marketplace upgrade`);
 				}
 			} catch {
 				// Silently ignore — network failure, corrupt data, offline.
@@ -783,7 +796,7 @@ export async function runRootCommand(parsed: Args, rawArgs: string[]): Promise<v
 	);
 	sessionOptions.authStorage = authStorage;
 	sessionOptions.modelRegistry = modelRegistry;
-	sessionOptions.hasUI = isInteractive;
+	sessionOptions.hasUI = isInteractive || mode === "rpc-ui";
 	sessionOptions.settings = settingsInstance;
 
 	// Handle CLI --api-key as runtime override (not persisted)
@@ -846,7 +859,7 @@ export async function runRootCommand(parsed: Args, rawArgs: string[]): Promise<v
 		}
 	}
 
-	if (!isInteractive && !session.model) {
+	if (!isInteractive && parsedArgs.mode !== "acp" && !session.model) {
 		if (modelFallbackMessage) {
 			process.stderr.write(`${chalk.red(modelFallbackMessage)}\n`);
 		} else {
@@ -879,8 +892,8 @@ export async function runRootCommand(parsed: Args, rawArgs: string[]): Promise<v
 		return nextSession;
 	};
 
-	if (mode === "rpc") {
-		await runRpcMode(session);
+	if (mode === "rpc" || mode === "rpc-ui") {
+		await runRpcMode(session, mode === "rpc-ui" ? setToolUIContext : undefined);
 	} else if (mode === "acp") {
 		await runAcpMode(session, createAcpSession);
 	} else if (isInteractive) {

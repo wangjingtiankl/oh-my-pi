@@ -4,7 +4,7 @@
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { type Agent, type AgentMessage, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import { type Agent, type AgentMessage, type AgentToolResult, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import {
 	type AssistantMessage,
 	type ImageContent,
@@ -37,18 +37,26 @@ import type {
 } from "../extensibility/extensions";
 import type { CompactOptions } from "../extensibility/extensions/types";
 import { BUILTIN_SLASH_COMMANDS, loadSlashCommands } from "../extensibility/slash-commands";
+import type { Goal, GoalModeState } from "../goals/state";
 import { resolveLocalUrlToPath } from "../internal-urls";
 import { LSP_STARTUP_EVENT_CHANNEL, type LspStartupEvent } from "../lsp/startup-events";
-import { renameApprovedPlanFile } from "../plan-mode/approved-plan";
+import { normalizePlanTitle, type PlanApprovalDetails, renameApprovedPlanFile } from "../plan-mode/approved-plan";
 import planModeApprovedPrompt from "../prompts/system/plan-mode-approved.md" with { type: "text" };
+import planModeCompactInstructionsPrompt from "../prompts/system/plan-mode-compact-instructions.md" with {
+	type: "text",
+};
 import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
+import type { CompactionOutcome } from "../session/compaction";
 import { HistoryStorage } from "../session/history-storage";
 import type { SessionContext, SessionManager } from "../session/session-manager";
 import { getRecentSessions } from "../session/session-manager";
+import { formatDuration } from "../slash-commands/helpers/format";
 import { STTController, type SttState } from "../stt";
-import type { ExitPlanModeDetails, LspStartupServerInfo } from "../tools";
+import type { LspStartupServerInfo } from "../tools";
 import { normalizeLocalScheme } from "../tools/path-utils";
+import { type ResolveToolDetails, runResolveInvocation } from "../tools/resolve";
 import { formatPhaseDisplayName } from "../tools/todo-write";
+import { ToolError } from "../tools/tool-errors";
 import type { EventBus } from "../utils/event-bus";
 import { getEditorCommand, openInEditor } from "../utils/external-editor";
 import { getSessionAccentAnsi, getSessionAccentHex } from "../utils/session-color";
@@ -123,6 +131,22 @@ function formatHudNoteMarker(count: number): string {
 	return theme.fg("dim", chalk.italic(` \u207a${sub}`));
 }
 
+type GoalSubcommand = "set" | "show" | "pause" | "resume" | "drop" | "budget";
+
+const GOAL_SUBCOMMANDS = new Set<GoalSubcommand>(["set", "show", "pause", "resume", "drop", "budget"]);
+
+function parseGoalSubcommand(args: string): { sub: GoalSubcommand | undefined; rest: string } {
+	const trimmed = args.trim();
+	if (!trimmed) return { sub: undefined, rest: "" };
+	const match = /^(\S+)(?:\s+([\s\S]*))?$/.exec(trimmed);
+	if (!match) return { sub: undefined, rest: trimmed };
+	const first = match[1].toLowerCase();
+	if (GOAL_SUBCOMMANDS.has(first as GoalSubcommand)) {
+		return { sub: first as GoalSubcommand, rest: match[2]?.trim() ?? "" };
+	}
+	return { sub: undefined, rest: trimmed };
+}
+
 /** Options for creating an InteractiveMode instance (for future API use) */
 export interface InteractiveModeOptions {
 	/** Providers that were migrated during startup */
@@ -164,6 +188,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	todoExpanded = false;
 	planModeEnabled = false;
 	planModePaused = false;
+	goalModeEnabled = false;
+	goalModePaused = false;
 	planModePlanFilePath: string | undefined = undefined;
 	loopModeEnabled = false;
 	loopPrompt: string | undefined = undefined;
@@ -212,6 +238,11 @@ export class InteractiveMode implements InteractiveModeContext {
 	readonly #version: string;
 	readonly #changelogMarkdown: string | undefined;
 	#planModePreviousTools: string[] | undefined;
+	#goalModePreviousTools: string[] | undefined;
+	#goalContinuationTimer: NodeJS.Timeout | undefined;
+	#goalTurnHadToolCalls = false;
+	#goalContinuationTurnInFlight = false;
+	#goalSuppressNextContinuation = false;
 	#planModePreviousModelState: { model: Model; thinkingLevel?: ThinkingLevel } | undefined;
 	#pendingModelSwitch: { model: Model; thinkingLevel?: ThinkingLevel } | undefined;
 	#planModeHasEntered = false;
@@ -473,6 +504,11 @@ export class InteractiveMode implements InteractiveModeContext {
 		// Subscribe to agent events
 		this.#subscribeToAgent();
 
+		this.#eventBusUnsubscribers.push(
+			this.session.subscribe(event => {
+				void this.#handleGoalSessionEvent(event);
+			}),
+		);
 		// Set up theme file watcher
 		onThemeChange(() => {
 			clearRenderCache();
@@ -516,12 +552,16 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	async getUserInput(): Promise<SubmittedUserInput> {
+		if (this.session.getGoalModeState()?.mode === "exiting") {
+			await this.#exitGoalMode({ reason: "completed", silent: true });
+		}
 		const { promise, resolve } = Promise.withResolvers<SubmittedUserInput>();
 		this.onInputCallback = input => {
 			this.onInputCallback = undefined;
 			resolve(input);
 		};
 		this.#scheduleLoopAutoSubmit();
+		this.#scheduleGoalContinuation();
 		return promise;
 	}
 
@@ -542,6 +582,48 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (this.#loopAutoSubmitTimer) {
 			clearTimeout(this.#loopAutoSubmitTimer);
 			this.#loopAutoSubmitTimer = undefined;
+		}
+	}
+
+	#scheduleGoalContinuation(): void {
+		this.#cancelGoalContinuation();
+		if (this.loopModeEnabled) return;
+		if (!this.onInputCallback) return;
+		if (!this.session.settings.get("goal.continuationModes").includes("interactive")) return;
+		if (this.planModeEnabled || this.planModePaused) return;
+		if (!this.goalModeEnabled || this.goalModePaused) return;
+		if (this.#goalSuppressNextContinuation) return;
+		if (this.#pendingSubmittedInput) return;
+		if (this.editor.getText().trim().length > 0) return;
+		if ((this.pendingImages?.length ?? 0) > 0) return;
+		const state = this.session.getGoalModeState();
+		if (!state?.enabled || state.goal.status !== "active") return;
+		const prompt = this.session.goalRuntime.buildContinuationPrompt();
+		if (!prompt) return;
+		this.#goalContinuationTimer = setTimeout(() => {
+			this.#goalContinuationTimer = undefined;
+			if (!this.onInputCallback) return;
+			if (!this.goalModeEnabled || this.goalModePaused) return;
+			if (this.#pendingSubmittedInput) return;
+			if (this.editor.getText().trim().length > 0) return;
+			if ((this.pendingImages?.length ?? 0) > 0) return;
+			const latestState = this.session.getGoalModeState();
+			if (!latestState?.enabled || latestState.goal.status !== "active") return;
+			this.#goalContinuationTurnInFlight = true;
+			this.onInputCallback(
+				this.startPendingSubmission({
+					text: prompt,
+					customType: "goal-continuation",
+					display: false,
+				}),
+			);
+		}, 800);
+	}
+
+	#cancelGoalContinuation(): void {
+		if (this.#goalContinuationTimer) {
+			clearTimeout(this.#goalContinuationTimer);
+			this.#goalContinuationTimer = undefined;
 		}
 	}
 
@@ -635,23 +717,36 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 	}
 
-	startPendingSubmission(input: { text: string; images?: ImageContent[] }): SubmittedUserInput {
+	startPendingSubmission(input: {
+		text: string;
+		images?: ImageContent[];
+		customType?: string;
+		display?: boolean;
+	}): SubmittedUserInput {
 		const submission: SubmittedUserInput = {
 			text: input.text,
 			images: input.images,
+			customType: input.customType,
+			display: input.display,
 			cancelled: false,
 			started: false,
 		};
 		this.#pendingSubmittedInput = submission;
-		const imageCount = submission.images?.length ?? 0;
-		this.optimisticUserMessageSignature = `${submission.text}\u0000${imageCount}`;
-		this.#pendingSubmissionDispose = this.recordLocalSubmission(submission.text, imageCount);
-		this.addMessageToChat({
-			role: "user",
-			content: [{ type: "text", text: submission.text }, ...(submission.images ?? [])],
-			attribution: "user",
-			timestamp: Date.now(),
-		});
+		if (!submission.customType) {
+			this.#resetGoalContinuationSuppression();
+			const imageCount = submission.images?.length ?? 0;
+			this.optimisticUserMessageSignature = `${submission.text}\u0000${imageCount}`;
+			this.#pendingSubmissionDispose = this.recordLocalSubmission(submission.text, imageCount);
+			this.addMessageToChat({
+				role: "user",
+				content: [{ type: "text", text: submission.text }, ...(submission.images ?? [])],
+				attribution: "user",
+				timestamp: Date.now(),
+			});
+		} else {
+			this.optimisticUserMessageSignature = undefined;
+			this.#pendingSubmissionDispose = undefined;
+		}
 		this.editor.setText("");
 		this.ensureLoadingAnimation();
 		this.ui.requestRender();
@@ -670,14 +765,19 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#pendingSubmissionDispose?.();
 		this.#pendingSubmissionDispose = undefined;
 		this.#pendingWorkingMessage = undefined;
+		if (submission.customType === "goal-continuation") {
+			this.#goalContinuationTurnInFlight = false;
+		}
 		if (this.loadingAnimation) {
 			this.loadingAnimation.stop();
 			this.loadingAnimation = undefined;
 			this.statusContainer.clear();
 		}
-		this.pendingImages = submission.images ? [...submission.images] : [];
-		this.rebuildChatFromMessages();
-		this.editor.setText(submission.text);
+		if (!submission.customType) {
+			this.pendingImages = submission.images ? [...submission.images] : [];
+			this.rebuildChatFromMessages();
+			this.editor.setText(submission.text);
+		}
 		this.updateEditorBorderColor();
 		this.ui.requestRender();
 		return true;
@@ -697,6 +797,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (wasPendingSubmission) {
 			this.#pendingSubmittedInput = undefined;
 			this.#pendingSubmissionDispose = undefined;
+		}
+		if (input.customType === "goal-continuation") {
+			this.#goalContinuationTurnInFlight = false;
 		}
 
 		if (wasPendingSubmission && !this.session.isStreaming && !this.streamingComponent) {
@@ -853,6 +956,95 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.ui.requestRender();
 	}
 
+	#updateGoalModeStatus(): void {
+		const status =
+			this.goalModeEnabled || this.goalModePaused
+				? { enabled: this.goalModeEnabled, paused: this.goalModePaused }
+				: undefined;
+		this.statusLine.setGoalModeStatus(status);
+		this.updateEditorTopBorder();
+		this.ui.requestRender();
+	}
+
+	#resetGoalContinuationSuppression(): void {
+		this.#goalSuppressNextContinuation = false;
+	}
+
+	#getPausedGoalState(): GoalModeState | undefined {
+		const state = this.session.getGoalModeState();
+		if (!state?.goal || state.enabled || state.goal.status !== "paused") {
+			return undefined;
+		}
+		return state;
+	}
+
+	#goalFromModeData(modeData: SessionContext["modeData"]): Goal | undefined {
+		const goal = modeData?.goal;
+		if (!goal || typeof goal !== "object") return undefined;
+		const value = goal as Record<string, unknown>;
+		if (
+			typeof value.id !== "string" ||
+			typeof value.objective !== "string" ||
+			typeof value.status !== "string" ||
+			typeof value.tokensUsed !== "number" ||
+			typeof value.timeUsedSeconds !== "number" ||
+			typeof value.createdAt !== "number" ||
+			typeof value.updatedAt !== "number"
+		) {
+			return undefined;
+		}
+		return {
+			id: value.id,
+			objective: value.objective,
+			status: value.status as Goal["status"],
+			tokenBudget: typeof value.tokenBudget === "number" ? value.tokenBudget : undefined,
+			tokensUsed: value.tokensUsed,
+			timeUsedSeconds: value.timeUsedSeconds,
+			createdAt: value.createdAt,
+			updatedAt: value.updatedAt,
+		};
+	}
+
+	async #handleGoalSessionEvent(event: AgentSessionEvent): Promise<void> {
+		if (event.type === "agent_start") {
+			this.#goalTurnHadToolCalls = false;
+			this.#cancelGoalContinuation();
+			return;
+		}
+		if (event.type === "tool_execution_start") {
+			this.#goalTurnHadToolCalls = true;
+			if (!this.#goalContinuationTurnInFlight) {
+				this.#resetGoalContinuationSuppression();
+			}
+			return;
+		}
+		if (event.type === "message_start" && event.message.role === "user" && !event.message.synthetic) {
+			this.#resetGoalContinuationSuppression();
+			return;
+		}
+		if (event.type === "goal_updated") {
+			this.goalModeEnabled = event.state?.enabled === true;
+			this.goalModePaused = event.state?.enabled !== true && event.state?.goal?.status === "paused";
+			if (!event.state?.enabled) {
+				this.#cancelGoalContinuation();
+			}
+			this.#updateGoalModeStatus();
+			return;
+		}
+		if (event.type !== "agent_end") {
+			return;
+		}
+		if (this.#goalContinuationTurnInFlight) {
+			this.#goalSuppressNextContinuation = !this.#goalTurnHadToolCalls;
+			this.#goalContinuationTurnInFlight = false;
+		}
+		if (this.session.getGoalModeState()?.mode === "exiting") {
+			await this.#exitGoalMode({ reason: "completed", silent: true });
+			return;
+		}
+		this.#scheduleGoalContinuation();
+	}
+
 	async #applyPlanModeModel(): Promise<void> {
 		const resolved = this.session.resolveRoleModelWithThinking("plan");
 		if (!resolved.model) return;
@@ -899,6 +1091,28 @@ export class InteractiveMode implements InteractiveModeContext {
 	/** Restore mode state from session entries on resume (e.g. plan mode). */
 	async #restoreModeFromSession(): Promise<void> {
 		const sessionContext = this.sessionManager.buildSessionContext();
+		const goalEnabled = this.session.settings.get("goal.enabled");
+		if (!goalEnabled && (sessionContext.mode === "goal" || sessionContext.mode === "goal_paused")) {
+			this.sessionManager.appendModeChange("none");
+			return;
+		}
+		if (sessionContext.mode === "goal" || sessionContext.mode === "goal_paused") {
+			const goal = this.#goalFromModeData(sessionContext.modeData);
+			if (!goal) {
+				this.sessionManager.appendModeChange("none");
+				return;
+			}
+			this.session.setGoalModeState({
+				enabled: sessionContext.mode === "goal",
+				mode: "active",
+				goal,
+			});
+			const restored = await this.session.goalRuntime.onThreadResumed();
+			this.goalModeEnabled = restored?.enabled === true;
+			this.goalModePaused = restored?.enabled !== true && restored?.goal.status === "paused";
+			this.#updateGoalModeStatus();
+			return;
+		}
 		if (!this.session.settings.get("plan.enabled")) {
 			// Clear stale plan/plan_paused mode so re-enabling the setting
 			// later doesn't unexpectedly restore an old plan session.
@@ -921,13 +1135,17 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (this.planModeEnabled) {
 			return;
 		}
+		if (this.goalModeEnabled || this.goalModePaused) {
+			this.showWarning("Exit goal mode first.");
+			return;
+		}
 
 		this.planModePaused = false;
 
 		const planFilePath = options?.planFilePath ?? (await this.#getPlanFilePath());
 		const previousTools = this.session.getActiveToolNames();
-		const hasExitTool = this.session.getToolByName("exit_plan_mode") !== undefined;
-		const planTools = hasExitTool ? [...previousTools, "exit_plan_mode"] : previousTools;
+		const hasResolveTool = this.session.getToolByName("resolve") !== undefined;
+		const planTools = hasResolveTool ? [...previousTools, "resolve"] : previousTools;
 		const uniquePlanTools = [...new Set(planTools)];
 
 		this.#planModePreviousTools = previousTools;
@@ -941,6 +1159,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			workflow: options?.workflow ?? "parallel",
 			reentry: this.#planModeHasEntered,
 		});
+		this.session.setStandingResolveHandler?.(input => this.#runPlanApprovalResolve(input));
 		if (this.session.isStreaming) {
 			await this.session.sendPlanModeContext({ deliverAs: "steer" });
 		}
@@ -949,6 +1168,47 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#updatePlanModeStatus();
 		this.sessionManager.appendModeChange("plan", { planFilePath });
 		this.showStatus(`Plan mode enabled. Plan file: ${planFilePath}`);
+	}
+
+	/** Standing resolve dispatcher registered while plan mode is active. The agent
+	 *  submits the finalized plan by calling `resolve { action: "apply", extra: { title } }`;
+	 *  this handler validates the plan file exists, normalizes the title, and shapes the
+	 *  payload that `event-controller` forwards to `handlePlanApproval`. */
+	#runPlanApprovalResolve(input: unknown): Promise<AgentToolResult<ResolveToolDetails>> {
+		return runResolveInvocation(input as Parameters<typeof runResolveInvocation>[0], {
+			sourceToolName: "plan_approval",
+			label: "Plan ready for approval",
+			apply: async (_reason, extra) => {
+				const state = this.session.getPlanModeState?.();
+				if (!state?.enabled) {
+					throw new ToolError("Plan mode is not active.");
+				}
+				const title = extra?.title;
+				if (typeof title !== "string" || title.trim() === "") {
+					throw new ToolError(
+						'Plan approval requires `extra: { title: "<PLAN_TITLE>" }`. Provide a title with letters, numbers, underscores, or hyphens only.',
+					);
+				}
+				const normalized = normalizePlanTitle(title);
+				const planFilePath = state.planFilePath;
+				const planContent = await this.#readPlanFile(planFilePath);
+				if (planContent === null) {
+					throw new ToolError(
+						`Plan file not found at ${planFilePath}. Write the finalized plan to ${planFilePath} before requesting approval.`,
+					);
+				}
+				const details: PlanApprovalDetails = {
+					planFilePath,
+					finalPlanFilePath: `local://${normalized.fileName}`,
+					title: normalized.title,
+					planExists: true,
+				};
+				return {
+					content: [{ type: "text" as const, text: "Plan ready for approval." }],
+					details,
+				};
+			},
+		});
 	}
 
 	async #exitPlanMode(options?: { silent?: boolean; paused?: boolean }): Promise<void> {
@@ -986,6 +1246,7 @@ export class InteractiveMode implements InteractiveModeContext {
 				}
 			}
 		}
+		this.session.setStandingResolveHandler?.(null);
 		this.session.setPlanModeState(undefined);
 		this.planModeEnabled = false;
 		this.planModePaused = options?.paused ?? false;
@@ -997,6 +1258,73 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.sessionManager.appendModeChange(paused ? "plan_paused" : "none");
 		if (!options?.silent) {
 			this.showStatus(paused ? "Plan mode paused." : "Plan mode disabled.");
+		}
+	}
+
+	async #enterGoalMode(options: { objective?: string; resume?: boolean; silent?: boolean }): Promise<void> {
+		if (this.goalModeEnabled) {
+			return;
+		}
+		if (this.planModeEnabled || this.planModePaused) {
+			this.showWarning("Exit plan mode first.");
+			return;
+		}
+		const previousTools = this.session.getActiveToolNames().filter(name => name !== "goal");
+		const goalTools = [...new Set([...previousTools, "goal"])];
+		this.#goalModePreviousTools = previousTools;
+		this.goalModePaused = false;
+		const state = options.resume
+			? await this.session.goalRuntime.resumeGoal()
+			: await this.session.goalRuntime.createGoal({ objective: options.objective ?? "" });
+		await this.session.setActiveToolsByName(goalTools);
+		this.session.setGoalModeState(state);
+		this.goalModeEnabled = true;
+		this.#resetGoalContinuationSuppression();
+		this.#updateGoalModeStatus();
+		if (this.session.isStreaming) {
+			await this.session.sendGoalModeContext({ deliverAs: "steer" });
+		}
+		if (!options.silent) {
+			this.showStatus(options.resume ? "Goal mode resumed." : "Goal mode enabled.");
+		}
+	}
+
+	async #exitGoalMode(options?: {
+		silent?: boolean;
+		paused?: boolean;
+		reason?: "completed" | "paused" | "dropped";
+	}): Promise<void> {
+		const previousTools = this.#goalModePreviousTools;
+		if (this.goalModeEnabled && previousTools) {
+			await this.session.setActiveToolsByName(previousTools);
+		}
+		const currentState = this.session.getGoalModeState();
+		if (options?.reason === "completed") {
+			this.session.setGoalModeState(undefined);
+			this.sessionManager.appendModeChange("none");
+			this.sessionManager.appendCustomEntry("goal-completed", {
+				objective: currentState?.goal?.objective,
+				tokensUsed: currentState?.goal?.tokensUsed,
+				tokenBudget: currentState?.goal?.tokenBudget,
+				timeUsedSeconds: currentState?.goal?.timeUsedSeconds,
+			});
+		}
+		this.goalModeEnabled = false;
+		this.goalModePaused = options?.paused ?? false;
+		this.#goalModePreviousTools = undefined;
+		this.#goalContinuationTurnInFlight = false;
+		this.#cancelGoalContinuation();
+		this.#updateGoalModeStatus();
+		if (!options?.silent) {
+			if (options?.reason === "completed") {
+				this.showStatus("Goal mode completed.");
+			} else if (options?.reason === "dropped") {
+				this.showStatus("Goal dropped.");
+			} else if (options?.paused) {
+				this.showStatus("Goal mode paused.");
+			} else {
+				this.showStatus("Goal mode disabled.");
+			}
 		}
 	}
 
@@ -1109,7 +1437,12 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	async #approvePlan(
 		planContent: string,
-		options: { planFilePath: string; finalPlanFilePath: string; preserveContext?: boolean },
+		options: {
+			planFilePath: string;
+			finalPlanFilePath: string;
+			preserveContext?: boolean;
+			compactBeforeExecute?: boolean;
+		},
 	): Promise<void> {
 		await renameApprovedPlanFile({
 			planFilePath: options.planFilePath,
@@ -1118,21 +1451,80 @@ export class InteractiveMode implements InteractiveModeContext {
 			getSessionId: () => this.sessionManager.getSessionId(),
 		});
 		const previousTools = this.#planModePreviousTools ?? this.session.getActiveToolNames();
-		await this.#exitPlanMode({ silent: true, paused: false });
-		if (!options.preserveContext) {
-			await this.handleClearCommand();
-			// The new session has a fresh local:// root — persist the approved plan there
-			// so `local://<title>.md` resolves correctly in the execution session.
-			const newLocalPath = resolveLocalUrlToPath(options.finalPlanFilePath, {
-				getArtifactsDir: () => this.sessionManager.getArtifactsDir(),
-				getSessionId: () => this.sessionManager.getSessionId(),
-			});
-			await Bun.write(newLocalPath, planContent);
+
+		// Mark the pending abort caused by the plan-mode → compaction transition as
+		// silent BEFORE #exitPlanMode raises it. The `finally` below clears the
+		// flag on every terminal compaction outcome (ok / cancelled / failed /
+		// throw) so a leaked flag cannot silence a later unrelated abort.
+		// Branchless mark+clear when !compactBeforeExecute: mark is gated; clear
+		// is unconditional and idempotent.
+		if (options.compactBeforeExecute) {
+			this.session.markPlanCompactAbortPending();
 		}
+		let compactOutcome: CompactionOutcome | undefined;
+		try {
+			await this.#exitPlanMode({ silent: true, paused: false });
+
+			if (!options.preserveContext) {
+				await this.handleClearCommand();
+				// The new session has a fresh local:// root — persist the approved plan there
+				// so `local://<title>.md` resolves correctly in the execution session.
+				const newLocalPath = resolveLocalUrlToPath(options.finalPlanFilePath, {
+					getArtifactsDir: () => this.sessionManager.getArtifactsDir(),
+					getSessionId: () => this.sessionManager.getSessionId(),
+				});
+				await Bun.write(newLocalPath, planContent);
+			} else if (options.compactBeforeExecute) {
+				// Distill the plan-mode transcript before the execution turn is queued so
+				// the plan-approved synthetic prompt lands as a fresh cache anchor.
+				// Outcome is consumed after tool-restoration and plan-reference-path
+				// bookkeeping below; `markPlanReferenceSent` is intentionally deferred
+				// past the cancel guard — see the comment at the cancel branch.
+				// Cancellation skips the synthetic-prompt dispatch (operator's explicit
+				// abort is honored); failure proceeds best-effort — approval intent stands.
+				const compactionPrompt = prompt.render(planModeCompactInstructionsPrompt, {
+					planFilePath: options.finalPlanFilePath,
+				});
+				// Pin the plan reference path BEFORE compaction so any user messages
+				// queued during the compaction await (which `handleCompactCommand`
+				// flushes via `flushCompactionQueue` before returning) see the
+				// approved plan in `#buildPlanReferenceMessage`. Reassignment after
+				// the try/finally is idempotent and kept for the !compactBeforeExecute
+				// branch.
+				this.session.setPlanReferencePath(options.finalPlanFilePath);
+				compactOutcome = await this.handleCompactCommand(compactionPrompt);
+			}
+		} finally {
+			// Unconditional clear. Idempotent: a no-op when the flag was never set
+			// (i.e., the !compactBeforeExecute branch), and a no-op when the flag
+			// was already consumed by AgentSession.#handleAgentEvent's aborted
+			// message_end stamping. Guarantees the flag is dead at every exit.
+			this.session.clearPlanCompactAbortPending();
+		}
+
+		// Tool restoration runs on every path — the plan mode tools must be
+		// retired regardless of whether the synthetic prompt fires.
 		if (previousTools.length > 0) {
 			await this.session.setActiveToolsByName(previousTools);
 		}
 		this.session.setPlanReferencePath(options.finalPlanFilePath);
+
+		if (compactOutcome === "cancelled") {
+			// Explicit abort: honor it. `executeCompaction` already surfaced
+			// `showError("Compaction cancelled")` to the operator; we add the
+			// deferred-dispatch warning and exit. `markPlanReferenceSent` is
+			// intentionally skipped here: `#planReferenceSent` stays false, so
+			// `AgentSession.#buildPlanReferenceMessage` will inject the plan
+			// reference on the operator's next `prompt()` call. If we marked it
+			// sent here, the executor's first turn would have no plan context.
+			this.showWarning(
+				"Plan approved, but compaction was cancelled — execution not dispatched. Submit a turn to continue.",
+			);
+			return;
+		}
+
+		// markPlanReferenceSent fires only on the dispatch path so the synthetic
+		// plan-approved prompt is the source of the reference injection.
 		this.session.markPlanReferenceSent();
 		const planModePrompt = prompt.render(planModeApprovedPrompt, {
 			planContent,
@@ -1143,6 +1535,10 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	async handlePlanModeCommand(initialPrompt?: string): Promise<void> {
+		if (this.goalModeEnabled || this.goalModePaused) {
+			this.showWarning("Exit goal mode first.");
+			return;
+		}
 		if (this.planModeEnabled) {
 			const confirmed = await this.showHookConfirm(
 				"Exit plan mode?",
@@ -1162,16 +1558,241 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 	}
 
-	async handleExitPlanModeTool(details: ExitPlanModeDetails): Promise<void> {
+	async #handleGoalBudgetCommand(rawBudget: string): Promise<void> {
+		const state = this.session.getGoalModeState();
+		if (!this.goalModeEnabled || !state?.enabled) {
+			this.showWarning("No active goal.");
+			return;
+		}
+		if (state.goal.status === "complete") {
+			this.showStatus("Goal is already complete.");
+			return;
+		}
+		const trimmed = rawBudget.trim().toLowerCase();
+		let nextBudget: number | undefined;
+		if (trimmed !== "off") {
+			const parsed = Number.parseInt(trimmed, 10);
+			if (!Number.isInteger(parsed) || parsed <= 0) {
+				this.showError("Goal budget must be a positive integer or `off`.");
+				return;
+			}
+			nextBudget = parsed;
+		}
+		await this.session.goalRuntime.onBudgetMutated(nextBudget);
+		this.#resetGoalContinuationSuppression();
+		this.#scheduleGoalContinuation();
+		this.showStatus(nextBudget === undefined ? "Goal budget cleared." : `Goal budget set to ${nextBudget}.`);
+	}
+
+	async handleGoalModeCommand(rest?: string): Promise<void> {
+		try {
+			if (this.planModeEnabled || this.planModePaused) {
+				this.showWarning("Exit plan mode first.");
+				return;
+			}
+			if (!this.session.settings.get("goal.enabled")) {
+				this.showWarning("Goal mode is disabled. Enable it in settings (goal.enabled).");
+				return;
+			}
+			const { sub, rest: subRest } = parseGoalSubcommand(rest ?? "");
+			if (sub) {
+				await this.#dispatchGoalSubcommand(sub, subRest);
+				return;
+			}
+			if (this.goalModeEnabled) {
+				if (subRest) {
+					this.showStatus("Goal mode is already active. Use /goal to manage it, or /goal drop to start over.");
+					return;
+				}
+				await this.#openGoalMenu("active");
+				return;
+			}
+			const pausedState = this.#getPausedGoalState();
+			if (pausedState) {
+				if (subRest) {
+					this.showWarning("Resume the current goal first, or drop it before setting a new objective.");
+					return;
+				}
+				await this.#openGoalMenu("paused");
+				return;
+			}
+			if (subRest) {
+				await this.#startGoalFromObjective(subRest);
+				return;
+			}
+			const objective = (
+				await this.showHookEditor("Goal objective", undefined, undefined, { promptStyle: true })
+			)?.trim();
+			if (!objective) return;
+			await this.#startGoalFromObjective(objective);
+		} catch (error) {
+			this.showError(error instanceof Error ? error.message : String(error));
+		}
+	}
+
+	async #dispatchGoalSubcommand(sub: GoalSubcommand, rest: string): Promise<void> {
+		switch (sub) {
+			case "set":
+				await this.#handleGoalSetSubcommand(rest);
+				return;
+			case "show":
+				this.#showGoalDetails();
+				return;
+			case "pause":
+				await this.#pauseGoalAction();
+				return;
+			case "resume":
+				await this.#resumeGoalAction();
+				return;
+			case "drop":
+				await this.#confirmAndDropGoal();
+				return;
+			case "budget":
+				if (!this.goalModeEnabled) {
+					this.showWarning(
+						this.#getPausedGoalState() ? "Resume the goal before adjusting the budget." : "No active goal.",
+					);
+					return;
+				}
+				if (!rest) {
+					await this.#promptGoalBudgetEdit();
+					return;
+				}
+				await this.#handleGoalBudgetCommand(rest);
+				return;
+		}
+	}
+
+	async #openGoalMenu(state: "active" | "paused"): Promise<void> {
+		const goal = this.session.getGoalModeState()?.goal;
+		if (!goal) return;
+		const summary = goal.objective.length > 48 ? `${goal.objective.slice(0, 47)}…` : goal.objective;
+		const title = state === "active" ? `Goal: ${summary} (${goal.status})` : `Goal paused: ${summary}`;
+		const items =
+			state === "active"
+				? ["Show details", "Adjust budget…", "Pause", "Drop"]
+				: ["Resume", "Show details", "Adjust budget…", "Drop"];
+		const choice = await this.showHookSelector(title, items);
+		if (!choice) return;
+		switch (choice) {
+			case "Show details":
+				this.#showGoalDetails();
+				return;
+			case "Adjust budget…":
+				await this.#promptGoalBudgetEdit();
+				return;
+			case "Pause":
+				await this.#pauseGoalAction();
+				return;
+			case "Resume":
+				await this.#resumeGoalAction();
+				return;
+			case "Drop":
+				await this.#confirmAndDropGoal();
+				return;
+		}
+	}
+
+	#showGoalDetails(): void {
+		const state = this.session.getGoalModeState();
+		const goal = state?.goal;
+		if (!goal) {
+			this.showStatus("No goal set.");
+			return;
+		}
+		const used = goal.tokensUsed.toLocaleString();
+		const budgetLine =
+			goal.tokenBudget !== undefined
+				? `${used} / ${goal.tokenBudget.toLocaleString()} (${Math.max(0, goal.tokenBudget - goal.tokensUsed).toLocaleString()} left)`
+				: `${used} (no budget)`;
+		const lines = [
+			`Objective: ${goal.objective}`,
+			`Status: ${goal.status}${state?.enabled ? "" : " (paused)"}`,
+			`Tokens: ${budgetLine}`,
+			`Time spent: ${formatDuration(goal.timeUsedSeconds * 1000)}`,
+		];
+		this.showStatus(lines.join("\n"));
+	}
+
+	async #promptGoalBudgetEdit(): Promise<void> {
+		const goal = this.session.getGoalModeState()?.goal;
+		const prefill = goal?.tokenBudget !== undefined ? String(goal.tokenBudget) : "";
+		const input = (
+			await this.showHookEditor("Goal budget (number, `off`, or empty to cancel)", prefill, undefined, {
+				promptStyle: true,
+			})
+		)?.trim();
+		if (!input) return;
+		await this.#handleGoalBudgetCommand(input);
+	}
+
+	async #pauseGoalAction(): Promise<void> {
+		if (!this.goalModeEnabled) {
+			this.showWarning("No active goal to pause.");
+			return;
+		}
+		await this.session.goalRuntime.pauseGoal();
+		await this.#exitGoalMode({ paused: true, reason: "paused" });
+	}
+
+	async #resumeGoalAction(): Promise<void> {
+		if (!this.#getPausedGoalState()) {
+			this.showWarning("No paused goal to resume.");
+			return;
+		}
+		await this.#enterGoalMode({ resume: true, silent: true });
+		this.showStatus("Goal mode resumed.");
+		this.#scheduleGoalContinuation();
+	}
+
+	async #confirmAndDropGoal(): Promise<void> {
+		if (!this.goalModeEnabled && !this.#getPausedGoalState()) {
+			this.showWarning("No goal to drop.");
+			return;
+		}
+		const confirmed = await this.showHookConfirm(
+			"Drop goal?",
+			"This removes the goal record. Accumulated usage stays in the session log.",
+		);
+		if (!confirmed) return;
+		await this.session.goalRuntime.dropGoal();
+		await this.#exitGoalMode({ reason: "dropped" });
+	}
+
+	async #startGoalFromObjective(objective: string): Promise<void> {
+		await this.#enterGoalMode({ objective, silent: true });
+		this.#resetGoalContinuationSuppression();
+		if (this.onInputCallback) {
+			this.onInputCallback(this.startPendingSubmission({ text: objective }));
+		}
+	}
+
+	async #handleGoalSetSubcommand(rest: string): Promise<void> {
+		if (this.goalModeEnabled) {
+			this.showStatus("Goal mode is already active. Use /goal drop to start over.");
+			return;
+		}
+		if (this.#getPausedGoalState()) {
+			this.showWarning("Resume the current goal first, or drop it before setting a new objective.");
+			return;
+		}
+		const objective = rest.trim()
+			? rest.trim()
+			: (await this.showHookEditor("Goal objective", undefined, undefined, { promptStyle: true }))?.trim();
+		if (!objective) return;
+		await this.#startGoalFromObjective(objective);
+	}
+
+	async handlePlanApproval(details: PlanApprovalDetails): Promise<void> {
 		if (!this.planModeEnabled) {
 			this.showWarning("Plan mode is not active.");
 			return;
 		}
 
-		// Abort the agent to prevent it from continuing (e.g., calling exit_plan_mode
-		// again) while the popup is showing. The event listener fires asynchronously
-		// (agent's #emit is fire-and-forget), so without this the model sees "Plan
-		// ready for approval." and immediately calls exit_plan_mode in a loop.
+		// Abort the agent to prevent it from continuing (e.g., re-submitting the
+		// plan) while the popup is showing. The event listener fires asynchronously
+		// (agent's #emit is fire-and-forget), so without this the model sees
+		// "Plan ready for approval." and immediately re-invokes `resolve` in a loop.
 		await this.session.abort();
 
 		const planFilePath = details.planFilePath || this.planModePlanFilePath || (await this.#getPlanFilePath());
@@ -1185,14 +1806,24 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#renderPlanPreview(planContent, { append: true });
 		const choice = await this.showHookSelector(
 			"Plan mode - next step",
-			["Approve and execute", "Approve and keep context", "Refine plan", "Stay in plan mode"],
+			[
+				"Approve and execute",
+				"Approve and compact context",
+				"Approve and keep context",
+				"Refine plan",
+				"Stay in plan mode",
+			],
 			{
 				helpText: this.#getPlanReviewHelpText(),
 				onExternalEditor: () => void this.#openPlanInExternalEditor(planFilePath),
 			},
 		);
 
-		if (choice === "Approve and execute" || choice === "Approve and keep context") {
+		if (
+			choice === "Approve and execute" ||
+			choice === "Approve and compact context" ||
+			choice === "Approve and keep context"
+		) {
 			const finalPlanFilePath = details.finalPlanFilePath || planFilePath;
 			try {
 				const latestPlanContent = await this.#readPlanFile(planFilePath);
@@ -1203,7 +1834,8 @@ export class InteractiveMode implements InteractiveModeContext {
 				await this.#approvePlan(latestPlanContent, {
 					planFilePath,
 					finalPlanFilePath,
-					preserveContext: choice === "Approve and keep context",
+					preserveContext: choice !== "Approve and execute",
+					compactBeforeExecute: choice === "Approve and compact context",
 				});
 			} catch (error) {
 				this.showError(
@@ -1230,6 +1862,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.loadingAnimation = undefined;
 		}
 		this.#cleanupMicAnimation();
+		this.#cancelGoalContinuation();
 		if (this.#sttController) {
 			this.#sttController.dispose();
 			this.#sttController = undefined;
@@ -1502,8 +2135,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		return this.#uiHelpers.isKnownSlashCommand(text);
 	}
 
-	addMessageToChat(message: AgentMessage, options?: { populateHistory?: boolean }): void {
-		this.#uiHelpers.addMessageToChat(message, options);
+	addMessageToChat(message: AgentMessage, options?: { populateHistory?: boolean }): Component[] {
+		return this.#uiHelpers.addMessageToChat(message, options);
 	}
 
 	renderSessionContext(
@@ -1727,7 +2360,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		await controller.handle(text);
 	}
 
-	handleCompactCommand(customInstructions?: string): Promise<void> {
+	handleCompactCommand(customInstructions?: string): Promise<CompactionOutcome> {
 		return this.#commandController.handleCompactCommand(customInstructions);
 	}
 
@@ -1735,7 +2368,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		return this.#commandController.handleHandoffCommand(customInstructions);
 	}
 
-	executeCompaction(customInstructionsOrOptions?: string | CompactOptions, isAuto?: boolean): Promise<void> {
+	executeCompaction(
+		customInstructionsOrOptions?: string | CompactOptions,
+		isAuto?: boolean,
+	): Promise<CompactionOutcome> {
 		return this.#commandController.executeCompaction(customInstructionsOrOptions, isAuto);
 	}
 

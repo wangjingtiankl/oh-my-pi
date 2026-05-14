@@ -4,11 +4,11 @@ import type { Component } from "@oh-my-pi/pi-tui";
 import { Markdown, Text } from "@oh-my-pi/pi-tui";
 import { prompt } from "@oh-my-pi/pi-utils";
 import { type Static, Type } from "@sinclair/typebox";
-import { jsBackend, parseEvalInput, pythonBackend } from "../eval";
+import { jsBackend, parseEvalInput, pythonBackend, sniffEvalLanguage } from "../eval";
 import type { ExecutorBackend } from "../eval/backend";
 import evalGrammar from "../eval/eval.lark" with { type: "text" };
-import type { ParsedEvalCell } from "../eval/parse";
-import type { EvalCellResult, EvalLanguage, EvalStatusEvent, EvalToolDetails } from "../eval/types";
+import { ABORT_WARNING, type ParsedEvalCell } from "../eval/parse";
+import type { EvalCellResult, EvalDisplayOutput, EvalLanguage, EvalStatusEvent, EvalToolDetails } from "../eval/types";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { truncateToVisualLines } from "../modes/components/visual-truncate";
 import { getMarkdownTheme, type Theme } from "../modes/theme/theme";
@@ -16,7 +16,7 @@ import evalDescription from "../prompts/tools/eval.md" with { type: "text" };
 import { DEFAULT_MAX_BYTES, OutputSink, type OutputSummary, TailBuffer } from "../session/streaming-output";
 import { getTreeBranch, getTreeContinuePrefix, renderCodeCell } from "../tui";
 import { resolveEvalBackends, type ToolSession } from ".";
-import { formatStyledTruncationWarning } from "./output-meta";
+import { formatStyledTruncationWarning, resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "./output-meta";
 import { formatTitle, replaceTabs, shortenPath, truncateToWidth, wrapBrackets } from "./render-utils";
 import { ToolAbortError, ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
@@ -26,7 +26,7 @@ export const EVAL_DEFAULT_PREVIEW_LINES = 10;
 
 export const evalSchema = Type.Object({
 	input: Type.String({
-		description: "eval input as a sequence of `===== <info> =====` cell headers followed by code",
+		description: 'eval input as a sequence of `*** Cell <lang>:"title"` cell headers followed by code',
 	}),
 });
 export type EvalToolParams = Static<typeof evalSchema>;
@@ -45,6 +45,38 @@ function formatJsonScalar(value: unknown): string {
 	if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") return String(value);
 	if (typeof value === "function") return "[function]";
 	return "[object]";
+}
+
+/** Cap per `display()` value sent back to the model. */
+const MAX_DISPLAY_TEXT_BYTES = 8000;
+
+function formatDisplayJsonForText(value: unknown): string {
+	let text: string;
+	try {
+		text = JSON.stringify(value, null, 2) ?? String(value);
+	} catch {
+		text = String(value);
+	}
+	if (text.length > MAX_DISPLAY_TEXT_BYTES) {
+		text = `${text.slice(0, MAX_DISPLAY_TEXT_BYTES)}\n… (${text.length - MAX_DISPLAY_TEXT_BYTES} chars truncated)`;
+	}
+	return text;
+}
+
+/**
+ * Format display() JSON values into text the model can see. Images are surfaced
+ * separately as ImageContent so the model can actually inspect them; this helper
+ * intentionally does not touch images.
+ */
+function formatDisplayOutputsForText(outputs: EvalDisplayOutput[]): string {
+	const chunks: string[] = [];
+	let displayIndex = 0;
+	for (const output of outputs) {
+		if (output.type !== "json") continue;
+		displayIndex++;
+		chunks.push(`display[${displayIndex}]:\n${formatDisplayJsonForText(output.data)}`);
+	}
+	return chunks.join("\n\n");
 }
 
 function renderJsonTree(value: unknown, theme: Theme, expanded: boolean, maxDepth = expanded ? 6 : 2): string[] {
@@ -131,33 +163,6 @@ function timeoutSecondsFromMs(timeoutMs: number): number {
 	return clampTimeout("eval", timeoutMs / 1000);
 }
 
-/**
- * Best-effort language sniff for cells with no explicit `language`.
- *
- * Order:
- * 1. Shebang on first line (`#!/usr/bin/env python`, `#!/usr/bin/env node`, etc.)
- * 2. Strong syntactic markers unique to one language. We bias false negatives over
- *    false positives — anything ambiguous returns `undefined` and the caller falls
- *    back to the default-backend rules.
- */
-function sniffLanguage(code: string): EvalLanguage | undefined {
-	const stripped = code.replace(/^\s+/, "");
-	if (stripped.startsWith("#!")) {
-		const firstLine = stripped.split("\n", 1)[0]!.toLowerCase();
-		if (/(\bpython\d?\b|\bipython\b)/.test(firstLine)) return "python";
-		if (/(\bnode\b|\bbun\b|\bdeno\b|\bjavascript\b|\bjs\b)/.test(firstLine)) return "js";
-	}
-	const jsMarkers =
-		/(^|\n)\s*(const|let|var|async\s+function|function\s*\*?\s*[\w$]*\s*\(|import\s+[^\n]+\sfrom\s|export\s+(default|const|let|function|class|async)|require\s*\(|console\.\w+\s*\(|=>|;\s*$)/m;
-	const pyMarkers =
-		/(^|\n)\s*(def\s+\w+\s*\(|from\s+[\w.]+\s+import|import\s+\w+(\s+as\s+\w+)?\s*$|class\s+\w+\s*[(:]|print\s*\(|elif\s+[^\n]*:|with\s+[^\n]+:\s*$|@[\w.]+\s*$)/m;
-	const hasJs = jsMarkers.test(code);
-	const hasPy = pyMarkers.test(code);
-	if (hasJs && !hasPy) return "js";
-	if (hasPy && !hasJs) return "python";
-	return undefined;
-}
-
 async function resolveBackend(
 	session: ToolSession,
 	requested: EvalLanguage | undefined,
@@ -180,7 +185,7 @@ async function resolveBackend(
 		return { backend: jsBackend, fallback: false };
 	}
 	// Auto-detect.
-	const sniffed = sniffLanguage(code);
+	const sniffed = sniffEvalLanguage(code);
 	if (sniffed === "python" && allowPy && (await pythonBackend.isAvailable(session))) {
 		return { backend: pythonBackend, fallback: false };
 	}
@@ -353,6 +358,8 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 				outputSink = new OutputSink({
 					artifactPath,
 					artifactId,
+					headBytes: resolveOutputSinkHeadBytes(session.settings),
+					maxColumns: resolveOutputMaxColumns(session.settings),
 					onChunk: chunk => {
 						appendTail(chunk);
 						pushUpdate();
@@ -397,13 +404,16 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 					const durationMs = Date.now() - startTime;
 
 					const cellStatusEvents: EvalStatusEvent[] = [];
+					const cellDisplayOutputs: EvalDisplayOutput[] = [];
 					let cellHasMarkdown = false;
 					for (const output of result.displayOutputs) {
 						if (output.type === "json") {
 							jsonOutputs.push(output.data);
+							cellDisplayOutputs.push(output);
 						}
 						if (output.type === "image") {
 							images.push({ type: "image", data: output.data, mimeType: output.mimeType });
+							cellDisplayOutputs.push(output);
 						}
 						if (output.type === "status") {
 							statusEvents.push(output.event);
@@ -414,7 +424,10 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 						}
 					}
 
-					const cellOutput = result.output.trim();
+					const stdoutTrimmed = result.output.trim();
+					const displayText = formatDisplayOutputsForText(cellDisplayOutputs);
+					const cellOutput =
+						stdoutTrimmed && displayText ? `${stdoutTrimmed}\n\n${displayText}` : stdoutTrimmed || displayText;
 					cellResult.output = cellOutput;
 					cellResult.exitCode = result.exitCode;
 					cellResult.durationMs = durationMs;
@@ -446,10 +459,11 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 						pushUpdate();
 						const errorMsg = result.output || "Command aborted";
 						const combinedOutput = cellOutputs.join("\n\n");
+						const abortSuffix = parsedInput.aborted ? `\n\n${ABORT_WARNING}` : "";
 						const outputText =
-							cells.length > 1
+							(cells.length > 1
 								? `${combinedOutput}\n\nCell ${i + 1} aborted: ${errorMsg}`
-								: combinedOutput || errorMsg;
+								: combinedOutput || errorMsg) + abortSuffix;
 
 						const summaryForMeta = await summarizeFinal(combinedOutput, finalizeOutput);
 						const details: EvalToolDetails = {
@@ -457,14 +471,13 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 							languages,
 							cells: cellResults,
 							jsonOutputs: jsonOutputs.length > 0 ? jsonOutputs : undefined,
-							images: images.length > 0 ? images : undefined,
 							statusEvents: statusEvents.length > 0 ? statusEvents : undefined,
 							isError: true,
 						};
 						if (notice) details.notice = notice;
 
 						return toolResult(details)
-							.text(outputText)
+							.content([{ type: "text", text: outputText }, ...images])
 							.truncationFromSummary(summaryForMeta, { direction: "tail" })
 							.done();
 					}
@@ -473,12 +486,13 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 						cellResult.status = "error";
 						pushUpdate();
 						const combinedOutput = cellOutputs.join("\n\n");
+						const abortSuffix = parsedInput.aborted ? `\n\n${ABORT_WARNING}` : "";
 						const outputText =
-							cells.length > 1
+							(cells.length > 1
 								? `${combinedOutput}\n\nCell ${i + 1} failed (exit code ${result.exitCode}). Earlier cells succeeded—their state persists. Fix only cell ${i + 1}.`
 								: combinedOutput
 									? `${combinedOutput}\n\nCommand exited with code ${result.exitCode}`
-									: `Command exited with code ${result.exitCode}`;
+									: `Command exited with code ${result.exitCode}`) + abortSuffix;
 
 						const summaryForMeta = await summarizeFinal(combinedOutput, finalizeOutput);
 						const details: EvalToolDetails = {
@@ -486,14 +500,13 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 							languages,
 							cells: cellResults,
 							jsonOutputs: jsonOutputs.length > 0 ? jsonOutputs : undefined,
-							images: images.length > 0 ? images : undefined,
 							statusEvents: statusEvents.length > 0 ? statusEvents : undefined,
 							isError: true,
 						};
 						if (notice) details.notice = notice;
 
 						return toolResult(details)
-							.text(outputText)
+							.content([{ type: "text", text: outputText }, ...images])
 							.truncationFromSummary(summaryForMeta, { direction: "tail" })
 							.done();
 					}
@@ -503,8 +516,13 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 				}
 
 				const combinedOutput = cellOutputs.join("\n\n");
+				const abortSuffix = parsedInput.aborted ? `\n\n${ABORT_WARNING}` : "";
+				const hasImages = images.length > 0;
 				const outputText =
-					combinedOutput || (jsonOutputs.length > 0 || images.length > 0 ? "(no text output)" : "(no output)");
+					(combinedOutput ||
+						(hasImages
+							? `(displayed ${images.length} image${images.length === 1 ? "" : "s"}; no text output)`
+							: "(no output)")) + abortSuffix;
 				const summaryForMeta = await summarizeFinal(combinedOutput, finalizeOutput);
 
 				const details: EvalToolDetails = {
@@ -512,13 +530,12 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 					languages,
 					cells: cellResults,
 					jsonOutputs: jsonOutputs.length > 0 ? jsonOutputs : undefined,
-					images: images.length > 0 ? images : undefined,
 					statusEvents: statusEvents.length > 0 ? statusEvents : undefined,
 				};
 				if (notice) details.notice = notice;
 
 				return toolResult(details)
-					.text(outputText)
+					.content([{ type: "text", text: outputText }, ...images])
 					.truncationFromSummary(summaryForMeta, { direction: "tail" })
 					.done();
 			} finally {

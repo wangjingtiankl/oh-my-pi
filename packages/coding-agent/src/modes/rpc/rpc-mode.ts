@@ -17,9 +17,9 @@ import type {
 	ExtensionUIDialogOptions,
 	ExtensionWidgetOptions,
 } from "../../extensibility/extensions";
-import { runExtensionCompact, runExtensionSetModel } from "../../extensibility/extensions/compact-handler";
 import { type Theme, theme } from "../../modes/theme/theme";
 import type { AgentSession } from "../../session/agent-session";
+import { initializeExtensions } from "../runtime-init";
 import { isRpcHostToolResult, isRpcHostToolUpdate, RpcHostToolBridge } from "./host-tools";
 import type {
 	RpcCommand,
@@ -154,8 +154,17 @@ export function requestRpcEditor(
  * Run in RPC mode.
  * Listens for JSON commands on stdin, outputs events and responses on stdout.
  */
-export async function runRpcMode(session: AgentSession): Promise<never> {
+export async function runRpcMode(
+	session: AgentSession,
+	setToolUIContext?: (uiContext: ExtensionUIContext, hasUI: boolean) => void,
+): Promise<never> {
 	// Signal to RPC clients that the server is ready to accept commands
+	// Suppress terminal notifications: they write \x07 (BEL) or OSC sequences directly to
+	// process.stdout with no newline, which the reader merges with the next JSON line and
+	// breaks JSON.parse. In RPC mode stdout is the JSON protocol channel — nothing else
+	// may write there.
+	process.env.PI_NOTIFICATIONS = "off";
+
 	process.stdout.write(`${JSON.stringify({ type: "ready" })}\n`);
 	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
 		process.stdout.write(`${JSON.stringify(obj)}\n`);
@@ -405,92 +414,25 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 		}
 	}
 
+	// Wire up UI context for tool execution (ask tool, etc.) and extensions.
+	// A single shared instance routes all responses received on stdin to the
+	// correct waiting promise regardless of which code path created the request.
+	const rpcUiContext = new RpcExtensionUIContext(pendingExtensionRequests, output);
+	setToolUIContext?.(rpcUiContext, true);
+
 	// Set up extensions with RPC-based UI context
-	const extensionRunner = session.extensionRunner;
-	if (extensionRunner) {
-		extensionRunner.initialize(
-			// ExtensionActions
-			{
-				sendMessage: (message, options) => {
-					session.sendCustomMessage(message, options).catch(e => {
-						output(error(undefined, "extension_send", e.message));
-					});
-				},
-				sendUserMessage: (content, options) => {
-					session.sendUserMessage(content, options).catch(e => {
-						output(error(undefined, "extension_send_user", e.message));
-					});
-				},
-				appendEntry: (customType, data) => {
-					session.sessionManager.appendCustomEntry(customType, data);
-				},
-				setLabel: (targetId, label) => {
-					session.sessionManager.appendLabelChange(targetId, label);
-				},
-				getActiveTools: () => session.getActiveToolNames(),
-				getAllTools: () => session.getAllToolNames(),
-				setActiveTools: (toolNames: string[]) => session.setActiveToolsByName(toolNames),
-				getCommands: () => [],
-				setModel: model => runExtensionSetModel(session, model),
-				getThinkingLevel: () => session.thinkingLevel,
-				setThinkingLevel: level => session.setThinkingLevel(level),
-				getSessionName: () => session.sessionManager.getSessionName(),
-				setSessionName: async name => {
-					await session.sessionManager.setSessionName(name, "user");
-				},
-			},
-			// ExtensionContextActions
-			{
-				getModel: () => session.agent.state.model,
-				isIdle: () => !session.isStreaming,
-				abort: () => session.abort(),
-				hasPendingMessages: () => session.queuedMessageCount > 0,
-				shutdown: () => {
-					shutdownState.requested = true;
-				},
-				getContextUsage: () => session.getContextUsage(),
-				getSystemPrompt: () => session.systemPrompt,
-				compact: instructionsOrOptions => runExtensionCompact(session, instructionsOrOptions),
-			},
-			// ExtensionCommandContextActions - commands invokable via prompt("/command")
-			{
-				getContextUsage: () => session.getContextUsage(),
-				waitForIdle: () => session.agent.waitForIdle(),
-				newSession: async options => {
-					const success = await session.newSession({ parentSession: options?.parentSession });
-					// Note: setup callback runs but no UI feedback in RPC mode
-					if (success && options?.setup) {
-						await options.setup(session.sessionManager);
-					}
-					return { cancelled: !success };
-				},
-				branch: async entryId => {
-					const result = await session.branch(entryId);
-					return { cancelled: result.cancelled };
-				},
-				navigateTree: async (targetId, options) => {
-					const result = await session.navigateTree(targetId, { summarize: options?.summarize });
-					return { cancelled: result.cancelled };
-				},
-				switchSession: async sessionPath => {
-					const success = await session.switchSession(sessionPath);
-					return { cancelled: !success };
-				},
-				reload: async () => {
-					await session.reload();
-				},
-				compact: instructionsOrOptions => runExtensionCompact(session, instructionsOrOptions),
-			},
-			new RpcExtensionUIContext(pendingExtensionRequests, output),
-		);
-		extensionRunner.onError(err => {
+	await initializeExtensions(session, {
+		reportSendError: (action, err) => {
+			output(error(undefined, action, err.message));
+		},
+		reportRuntimeError: err => {
 			output({ type: "extension_error", extensionPath: err.extensionPath, event: err.event, error: err.error });
-		});
-		// Emit session_start event
-		await extensionRunner.emit({
-			type: "session_start",
-		});
-	}
+		},
+		onShutdown: () => {
+			shutdownState.requested = true;
+		},
+		uiContext: rpcUiContext,
+	});
 
 	// Output all agent events as JSON
 	session.subscribe(event => {
@@ -835,8 +777,8 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 	async function checkShutdownRequested(): Promise<void> {
 		if (!shutdownState.requested) return;
 
-		if (extensionRunner?.hasHandlers("session_shutdown")) {
-			await extensionRunner.emit({ type: "session_shutdown" });
+		if (session.extensionRunner?.hasHandlers("session_shutdown")) {
+			await session.extensionRunner.emit({ type: "session_shutdown" });
 		}
 
 		process.exit(0);

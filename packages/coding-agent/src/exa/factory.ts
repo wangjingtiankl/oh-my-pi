@@ -3,7 +3,7 @@
  */
 import type { TObject, TProperties } from "@sinclair/typebox";
 import type { CustomTool } from "../extensibility/custom-tools/types";
-import { callExaTool, findApiKey, formatSearchResults, isSearchResponse } from "./mcp-client";
+import { callExaTool, findApiKey, formatGenericResponse, formatSearchResults, isSearchResponse } from "./mcp-client";
 import type { ExaRenderDetails } from "./types";
 
 /** Creates an Exa tool with standardized API key handling, error wrapping, and optional search response formatting. */
@@ -44,7 +44,7 @@ export function createExaTool(
 				}
 
 				return {
-					content: [{ type: "text" as const, text: JSON.stringify(response, null, 2) }],
+					content: [{ type: "text" as const, text: formatGenericResponse(response) }],
 					details: { raw: response, toolName: name },
 				};
 			} catch (error) {

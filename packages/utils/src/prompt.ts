@@ -8,7 +8,7 @@ export type PromptRenderPhase = "pre-render" | "post-render";
 export interface PromptFormatOptions {
 	renderPhase?: PromptRenderPhase;
 	replaceAsciiSymbols?: boolean;
-	boldRfc2119Keywords?: boolean;
+	normalizeRfc2119?: boolean;
 }
 
 // Opening XML tag (not self-closing, not closing)
@@ -22,21 +22,27 @@ const TABLE_ROW = /^\|.*\|$/;
 // Table separator (|---|---|)
 const TABLE_SEP = /^\|[-:\s|]+\|$/;
 
-/** RFC 2119 keywords used in prompts. */
-const RFC2119_KEYWORDS = /\b(?:MUST NOT|SHOULD NOT|SHALL NOT|RECOMMENDED|REQUIRED|OPTIONAL|SHOULD|SHALL|MUST|MAY)\b/g;
+/**
+ * RFC 2119 keywords (plus project aliases NEVER/AVOID) wrapped in markdown bold
+ * — `**MUST**`, `**MUST NOT**`, `**NEVER**`, etc.
+ */
+const RFC2119_BOLD = /\*\*(MUST NOT|SHOULD NOT|RECOMMENDED|REQUIRED|OPTIONAL|SHOULD|MUST|MAY|NEVER|AVOID)\*\*/g;
 
-function boldRfc2119Keywords(line: string): string {
-	return line.replace(RFC2119_KEYWORDS, (match, offset, source) => {
-		const isAlreadyBold =
-			source[offset - 2] === "*" &&
-			source[offset - 1] === "*" &&
-			source[offset + match.length] === "*" &&
-			source[offset + match.length + 1] === "*";
-		if (isAlreadyBold) {
-			return match;
-		}
-		return `**${match}**`;
-	});
+/**
+ * Normalize RFC 2119 markers per project convention:
+ *   - Strip `**KEYWORD**` bold (visual noise, no semantics).
+ *   - Alias `MUST NOT` → `NEVER` and `SHOULD NOT` → `AVOID` (single-token equivalents).
+ * Skips spans inside inline code (`` `…` ``) so alias definitions can be quoted literally.
+ */
+function normalizeRfc2119(line: string): string {
+	const segments = line.split("`");
+	for (let i = 0; i < segments.length; i += 2) {
+		segments[i] = segments[i]
+			.replace(RFC2119_BOLD, "$1")
+			.replace(/\bMUST NOT\b/g, "NEVER")
+			.replace(/\bSHOULD NOT\b/g, "AVOID");
+	}
+	return segments.join("`");
 }
 
 /** Compact a table row by trimming cell padding */
@@ -60,6 +66,13 @@ function compactTableSep(line: string): string {
 	return `|${normalized.join("|")}|`;
 }
 
+const HTML_COMMENT_OPEN = "<!--";
+const HTML_COMMENT_CLOSE = "-->";
+
+type HtmlCommentState = {
+	inHtmlComment: boolean;
+};
+
 function replaceCommonAsciiSymbols(line: string): string {
 	return line
 		.replace(/\.{3}/g, "…")
@@ -71,16 +84,59 @@ function replaceCommonAsciiSymbols(line: string): string {
 		.replace(/>=/g, "≥");
 }
 
+function replaceCommonAsciiSymbolsOutsideHtmlComments(line: string, state: HtmlCommentState): string {
+	if (!state.inHtmlComment && !line.includes(HTML_COMMENT_OPEN) && !line.includes(HTML_COMMENT_CLOSE)) {
+		return replaceCommonAsciiSymbols(line);
+	}
+
+	let result = "";
+	let cursor = 0;
+
+	while (cursor < line.length) {
+		if (state.inHtmlComment) {
+			const closeIndex = line.indexOf(HTML_COMMENT_CLOSE, cursor);
+			if (closeIndex === -1) {
+				return result + line.slice(cursor);
+			}
+			result += line.slice(cursor, closeIndex + HTML_COMMENT_CLOSE.length);
+			cursor = closeIndex + HTML_COMMENT_CLOSE.length;
+			state.inHtmlComment = false;
+			continue;
+		}
+
+		const openIndex = line.indexOf(HTML_COMMENT_OPEN, cursor);
+		if (openIndex === -1) {
+			result += replaceCommonAsciiSymbols(line.slice(cursor));
+			return result;
+		}
+
+		result += replaceCommonAsciiSymbols(line.slice(cursor, openIndex));
+		const closeIndex = line.indexOf(HTML_COMMENT_CLOSE, openIndex + HTML_COMMENT_OPEN.length);
+		if (closeIndex === -1) {
+			result += line.slice(openIndex);
+			state.inHtmlComment = true;
+			return result;
+		}
+
+		result += line.slice(openIndex, closeIndex + HTML_COMMENT_CLOSE.length);
+		cursor = closeIndex + HTML_COMMENT_CLOSE.length;
+	}
+
+	return result;
+}
+
 export function format(content: string, options: PromptFormatOptions = {}): string {
 	const {
 		renderPhase = "post-render",
 		replaceAsciiSymbols = false,
-		boldRfc2119Keywords: shouldBoldRfc2119 = false,
+		normalizeRfc2119: shouldNormalizeRfc2119 = false,
 	} = options;
 	const isPreRender = renderPhase === "pre-render";
 	const lines = content.split("\n");
 	const result: string[] = [];
 	let inCodeBlock = false;
+
+	const htmlCommentState: HtmlCommentState = { inHtmlComment: false };
 	const topLevelTags: string[] = [];
 
 	for (let i = 0; i < lines.length; i++) {
@@ -98,7 +154,7 @@ export function format(content: string, options: PromptFormatOptions = {}): stri
 		}
 
 		if (replaceAsciiSymbols) {
-			line = replaceCommonAsciiSymbols(line);
+			line = replaceCommonAsciiSymbolsOutsideHtmlComments(line, htmlCommentState);
 		}
 		trimmedStart = line.trimStart();
 		const trimmed = line.trim();
@@ -125,8 +181,8 @@ export function format(content: string, options: PromptFormatOptions = {}): stri
 			line = `${leadingWhitespace}${compactTableRow(trimmedStart)}`;
 		}
 
-		if (shouldBoldRfc2119) {
-			line = boldRfc2119Keywords(line);
+		if (shouldNormalizeRfc2119) {
+			line = normalizeRfc2119(line);
 		}
 
 		if (trimmed === "") {

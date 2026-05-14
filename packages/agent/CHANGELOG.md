@@ -2,6 +2,32 @@
 
 ## [Unreleased]
 
+## [15.0.1] - 2026-05-14
+### Breaking Changes
+
+- Raised the minimum required Bun version from >=1.3.7 to >=1.3.14
+
+## [14.9.5] - 2026-05-12
+
+### Added
+
+- Added an `isError?: boolean` field on `AgentToolResult` so tools can flag a non-throwing failure (e.g. an aggregator that catches per-entry errors). `coerceToolResult` preserves the flag and the agent loop surfaces it as a tool error on the wire.
+
+## [14.9.3] - 2026-05-10
+### Added
+
+- Added `onHarmonyLeak` option on `Agent`/loop config to receive GPT-5 Harmony leak audit callbacks
+- Added harmony-leak detection and audit exports to the package index for programmatic leak detection and recovery hooks
+
+### Changed
+
+- Changed OpenAI Codex model runs to detect GPT-5 Harmony protocol leakage during streaming and automatically retry or recover tool calls instead of sending contaminated arguments downstream
+
+### Security
+
+- Hardened tool-call handling against leaked `to=functions.*` protocol tails by truncating or retrying before execution
+- Hardened failure handling so repeated GPT-5 Harmony leak mitigation is retried only up to two times before escalating to an explicit error
+
 ## [14.9.0] - 2026-05-10
 ### Added
 

@@ -1,5 +1,5 @@
 import * as path from "node:path";
-import { FILE_HEADER_PREFIX } from "./constants";
+import { ABORT_MARKER, BEGIN_PATCH_MARKER, END_PATCH_MARKER, FILE_HEADER_PREFIX } from "./constants";
 import { HL_EDIT_SEP } from "./hash";
 import type { SplitHashlineOptions } from "./types";
 import { stripTrailingCarriageReturn } from "./utils";
@@ -27,21 +27,39 @@ function normalizeHashlinePath(rawPath: string, cwd?: string): string {
 
 function parseHashlineHeaderLine(line: string, cwd?: string): HashlineInputSection | null {
 	const trimmed = line.trimEnd();
-	if (trimmed === FILE_HEADER_PREFIX) {
+	if (!trimmed.startsWith(FILE_HEADER_PREFIX)) return null;
+	// Some models occasionally emit unified-diff-style "@@ path" (or even longer
+	// runs of "@"). Strip every leading "@" before resolving the path so those
+	// stray headers still route to the right file.
+	let prefixEnd = 0;
+	while (prefixEnd < trimmed.length && trimmed[prefixEnd] === FILE_HEADER_PREFIX) prefixEnd++;
+	const rest = trimmed.slice(prefixEnd);
+	if (rest.trim().length === 0) {
 		throw new Error(`Input header "${FILE_HEADER_PREFIX}" is empty; provide a file path.`);
 	}
-	if (!trimmed.startsWith(FILE_HEADER_PREFIX)) return null;
-	const parsedPath = normalizeHashlinePath(trimmed.slice(1), cwd);
+	const parsedPath = normalizeHashlinePath(rest, cwd);
 	if (parsedPath.length === 0) {
 		throw new Error(`Input header "${FILE_HEADER_PREFIX}" is empty; provide a file path.`);
 	}
 	return { path: parsedPath, diff: "" };
 }
 
+function isPatchEnvelopeMarker(line: string): boolean {
+	const trimmed = line.trimEnd();
+	return trimmed === BEGIN_PATCH_MARKER || trimmed === END_PATCH_MARKER;
+}
+
 function stripLeadingBlankLines(input: string): string {
 	const stripped = input.startsWith("\uFEFF") ? input.slice(1) : input;
 	const lines = stripped.split("\n");
-	while (lines.length > 0 && lines[0].replace(/\r$/, "").trim().length === 0) lines.shift();
+	while (lines.length > 0) {
+		const head = lines[0].replace(/\r$/, "");
+		if (head.trim().length === 0 || head.trimEnd() === BEGIN_PATCH_MARKER) {
+			lines.shift();
+			continue;
+		}
+		break;
+	}
 	return lines.join("\n");
 }
 
@@ -79,8 +97,8 @@ export function splitHashlineInputs(input: string, options: SplitHashlineOptions
 	if (parseHashlineHeaderLine(firstLine, options.cwd) === null) {
 		const preview = JSON.stringify(firstLine.slice(0, 120));
 		throw new Error(
-			`input must begin with "@PATH" on the first non-blank line; got: ${preview}. ` +
-				`Example: "@src/foo.ts" then edit ops.`,
+			`input must begin with "@@ PATH" on the first non-blank line; got: ${preview}. ` +
+				`Example: "@@ src/foo.ts" then edit ops.`,
 		);
 	}
 
@@ -96,6 +114,8 @@ export function splitHashlineInputs(input: string, options: SplitHashlineOptions
 
 	for (const rawLine of lines) {
 		const line = stripTrailingCarriageReturn(rawLine);
+		if (line.trimEnd() === END_PATCH_MARKER || line.trimEnd() === ABORT_MARKER) break;
+		if (isPatchEnvelopeMarker(line)) continue;
 		const header = parseHashlineHeaderLine(line, options.cwd);
 		if (header !== null) {
 			flush();

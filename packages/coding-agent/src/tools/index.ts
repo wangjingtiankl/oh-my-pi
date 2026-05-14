@@ -1,17 +1,19 @@
 import type { AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { ToolChoice } from "@oh-my-pi/pi-ai";
 import { $env, $flag, logger } from "@oh-my-pi/pi-utils";
-import type { AsyncJobManager } from "../async";
 import type { PromptTemplate } from "../config/prompt-templates";
 import type { Settings } from "../config/settings";
 import { EditTool } from "../edit";
 import { checkPythonKernelAvailability } from "../eval/py/kernel";
 import type { Skill } from "../extensibility/skills";
+import type { GoalModeState, GoalRuntime } from "../goals";
+import { GoalTool } from "../goals/tools/goal-tool";
 import type { HindsightSessionState } from "../hindsight/state";
-import type { InternalUrlRouter } from "../internal-urls";
 import { LspTool } from "../lsp";
 import type { PlanModeState } from "../plan-mode/state";
-import type { AgentRegistry } from "../registry/agent-registry";
+import { type AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
+import type { ArtifactManager } from "../session/artifacts";
+import type { ClientBridge } from "../session/client-bridge";
 import type { CustomMessage } from "../session/messages";
 import type { ToolChoiceQueue } from "../session/tool-choice-queue";
 import { TaskTool } from "../task";
@@ -29,7 +31,6 @@ import { CalculatorTool } from "./calculator";
 import { type CheckpointState, CheckpointTool, RewindTool } from "./checkpoint";
 import { DebugTool } from "./debug";
 import { EvalTool } from "./eval";
-import { ExitPlanModeTool } from "./exit-plan-mode";
 import { FindTool } from "./find";
 import { GithubTool } from "./gh";
 import { HindsightRecallTool } from "./hindsight-recall";
@@ -57,6 +58,7 @@ import { YieldTool } from "./yield";
 export * from "../edit";
 export * from "../exa";
 export type * from "../exa/types";
+export * from "../goals";
 export * from "../lsp";
 export * from "../session/streaming-output";
 export * from "../task";
@@ -70,7 +72,6 @@ export * from "./calculator";
 export * from "./checkpoint";
 export * from "./debug";
 export * from "./eval";
-export * from "./exit-plan-mode";
 export * from "./find";
 export * from "./gh";
 export * from "./hindsight-recall";
@@ -159,6 +160,8 @@ export interface ToolSession {
 	agentRegistry?: AgentRegistry;
 	/** Get artifacts directory for artifact:// URLs */
 	getArtifactsDir?: () => string | null;
+	/** Get the ArtifactManager backing this session (shared across parent + subagents). */
+	getArtifactManager?: () => ArtifactManager | null;
 	/** Allocate a new artifact path and ID for session-scoped truncated output. */
 	allocateOutputArtifact?: (toolType: string) => Promise<{ id?: string; path?: string }>;
 	/** Get session spawns */
@@ -171,18 +174,18 @@ export interface ToolSession {
 	authStorage?: import("../session/auth-storage").AuthStorage;
 	/** Model registry for passing to subagents (avoids re-discovery) */
 	modelRegistry?: import("../config/model-registry").ModelRegistry;
-	/** MCP manager for proxying MCP calls through parent */
-	mcpManager?: import("../mcp/manager").MCPManager;
-	/** Internal URL router for protocols like agent://, skill://, and mcp:// */
-	internalRouter?: InternalUrlRouter;
 	/** Agent output manager for unique agent:// IDs across task invocations */
 	agentOutputManager?: AgentOutputManager;
-	/** Async background job manager for bash/task async execution */
-	asyncJobManager?: AsyncJobManager;
 	/** Settings instance for passing to subagents */
 	settings: Settings;
 	/** Plan mode state (if active) */
 	getPlanModeState?: () => PlanModeState | undefined;
+	/** Goal mode state (if active or paused) */
+	getGoalModeState?: () => GoalModeState | undefined;
+	/** Goal runtime for the active agent session. */
+	getGoalRuntime?: () => GoalRuntime | undefined;
+	/** Bridge to the connected client (e.g. ACP editor host). Tools should route fs/terminal/permission requests through this when available. */
+	getClientBridge?: () => ClientBridge | undefined;
 	/** Get compact conversation context for subagents (excludes tool results, system prompts) */
 	getCompactContext?: () => string;
 	/** Get cached todo phases for this session. */
@@ -222,6 +225,12 @@ export interface ToolSession {
 	steer?(message: { customType: string; content: string; details?: unknown }): void;
 	/** Peek the currently in-flight tool-choice queue directive's invocation handler. Used by the `resolve` tool to dispatch to the pending action. */
 	peekQueueInvoker?(): ((input: unknown) => Promise<unknown> | unknown) | undefined;
+	/** Peek the long-lived "standing" resolve handler registered by a mode (e.g. plan mode).
+	 *  Consulted by the `resolve` tool as a fallback when no queue invoker is in flight,
+	 *  letting modes accept `resolve` invocations without forcing the tool choice every turn. */
+	peekStandingResolveHandler?(): ((input: unknown) => Promise<unknown> | unknown) | undefined;
+	/** Register or clear the standing resolve handler. Passing `null` clears it. */
+	setStandingResolveHandler?(handler: ((input: unknown) => Promise<unknown> | unknown) | null): void;
 	/** Get active checkpoint state if any. */
 	getCheckpointState?: () => CheckpointState | undefined;
 	/** Set or clear active checkpoint state. */
@@ -232,6 +241,12 @@ export interface ToolSession {
 	 *  the version the model authored anchors against when the file changed
 	 *  out-of-band. Lazily initialized by `getFileReadCache`. */
 	fileReadCache?: import("../edit/file-read-cache").FileReadCache;
+
+	/** Per-session log of unresolved git merge conflict regions surfaced by
+	 *  `read`. Each entry gets a stable id N referenced by `write conflict://N`
+	 *  to splice the recorded region with replacement content. Lazily initialized
+	 *  by `getConflictHistory`. */
+	conflictHistory?: import("./conflict-detect").ConflictHistory;
 
 	/** Queue a hidden message to be injected at the next agent turn. */
 	queueDeferredMessage?(message: CustomMessage): void;
@@ -282,7 +297,7 @@ export const BUILTIN_TOOLS: Record<string, ToolFactory> = {
 	browser: s => new BrowserTool(s),
 	checkpoint: CheckpointTool.createIf,
 	rewind: RewindTool.createIf,
-	task: TaskTool.create,
+	task: s => TaskTool.create(s),
 	job: JobTool.createIf,
 	recipe: RecipeTool.createIf,
 	irc: IrcTool.createIf,
@@ -299,8 +314,8 @@ export const HIDDEN_TOOLS: Record<string, ToolFactory> = {
 	yield: s => new YieldTool(s),
 	report_finding: () => reportFindingTool,
 	report_tool_issue: s => createReportToolIssueTool(s),
-	exit_plan_mode: s => new ExitPlanModeTool(s),
 	resolve: s => new ResolveTool(s),
+	goal: s => new GoalTool(s),
 };
 
 export type ToolName = keyof typeof BUILTIN_TOOLS;
@@ -347,11 +362,12 @@ export function resolveEvalBackends(session: ToolSession): EvalBackendsAllowance
 export async function createTools(session: ToolSession, toolNames?: string[]): Promise<Tool[]> {
 	const includeYield = session.requireYieldTool === true;
 	const enableLsp = session.enableLsp ?? true;
-	const requestedTools =
+	let requestedTools =
 		toolNames && toolNames.length > 0 ? [...new Set(toolNames.map(name => name.toLowerCase()))] : undefined;
-	const planEnabled = session.settings.get("plan.enabled");
-	if (planEnabled && requestedTools && !requestedTools.includes("exit_plan_mode")) {
-		requestedTools.push("exit_plan_mode");
+	const goalEnabled = session.settings.get("goal.enabled");
+	const goalModeActive = goalEnabled && session.getGoalModeState?.()?.enabled === true;
+	if (goalModeActive && requestedTools && !requestedTools.includes("goal")) {
+		requestedTools = [...requestedTools, "goal"];
 	}
 	const backends = resolveEvalBackends(session);
 	const allowPython = backends.python;
@@ -424,7 +440,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 
 	const allTools: Record<string, ToolFactory> = { ...BUILTIN_TOOLS, ...HIDDEN_TOOLS };
 	const isToolAllowed = (name: string) => {
-		if (name === "exit_plan_mode") return planEnabled;
+		if (name === "goal") return goalEnabled && goalModeActive;
 		if (name === "lsp") return enableLsp && session.settings.get("lsp.enabled");
 		if (name === "bash") return true;
 		if (name === "eval") return allowEval;
@@ -443,7 +459,13 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		if (name === "calc") return session.settings.get("calc.enabled");
 		if (name === "browser") return session.settings.get("browser.enabled");
 		if (name === "checkpoint" || name === "rewind") return session.settings.get("checkpoint.enabled");
-		if (name === "irc") return session.settings.get("irc.enabled");
+		if (name === "irc") {
+			if (!session.settings.get("irc.enabled")) return false;
+			// Main agent only needs `irc` when subagents may run concurrently (async).
+			// In sync mode main blocks on `task`, so peer messaging from main is dead weight.
+			if (!session.settings.get("async.enabled") && session.getAgentId?.() === MAIN_AGENT_ID) return false;
+			return true;
+		}
 		if (name === "recipe") return session.settings.get("recipe.enabled");
 		if (name === "retain" || name === "recall" || name === "reflect") {
 			return session.settings.get("memory.backend") === "hindsight";
@@ -468,7 +490,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 						.filter(([name]) => isToolAllowed(name))
 						.map(([name, factory]) => [name, factory] as const),
 					...(includeYield ? ([["yield", HIDDEN_TOOLS.yield]] as const) : []),
-					...(planEnabled ? ([["exit_plan_mode", HIDDEN_TOOLS.exit_plan_mode]] as const) : []),
+					...(goalModeActive ? ([["goal", HIDDEN_TOOLS.goal]] as const) : []),
 				];
 
 	const baseResults = await Promise.all(
@@ -478,8 +500,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		}),
 	);
 	const tools = baseResults.filter((r): r is Tool => r !== null);
-	const hasDeferrableTools = tools.some(tool => tool.deferrable === true);
-	if (hasDeferrableTools && !tools.some(tool => tool.name === "resolve")) {
+	if (!tools.some(tool => tool.name === "resolve")) {
 		const resolveTool = await logger.time("createTools:resolve", HIDDEN_TOOLS.resolve, session);
 		if (resolveTool) {
 			tools.push(wrapToolWithMetaNotice(resolveTool));

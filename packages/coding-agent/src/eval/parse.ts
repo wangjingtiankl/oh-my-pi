@@ -1,3 +1,4 @@
+import { sniffEvalLanguage } from "./sniff";
 import type { EvalLanguage } from "./types";
 
 export type EvalLanguageOrigin = "default" | "header";
@@ -14,135 +15,141 @@ export interface ParsedEvalCell {
 
 export interface ParsedEvalInput {
 	cells: ParsedEvalCell[];
+	/**
+	 * True when the parser encountered `*** Abort` (recovery sentinel emitted
+	 * by the agent loop's harmony-leak mitigation; see
+	 * `docs/ERRATA-GPT5-HARMONY.md`). The cell containing the marker, if any,
+	 * is dropped — its body is incomplete and unsafe to execute.
+	 */
+	aborted?: boolean;
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000;
+const DEFAULT_LANGUAGE: EvalLanguage = "python";
 
 /**
- * Canonical language tokens we map onto our two backends. Matched
- * case-insensitively. Unknown tokens are treated as title fragments rather
- * than languages; this is intentional fallback behaviour and MUST NOT be
- * advertised in the tool's prompt — the lark grammar describes the
- * canonical surface we encourage callers to emit.
+ * Canonical language tokens plus common long-form aliases. The grammar
+ * advertises only `PY` / `JS` / `TS`, but unconstrained models reach for
+ * `Python` / `JavaScript` / `TypeScript` often enough that we accept them.
  */
-const LANGUAGE_ALIASES: Record<string, EvalLanguage> = {
-	py: "python",
-	python: "python",
-	ipy: "python",
-	ipython: "python",
-	js: "js",
-	javascript: "js",
-	ts: "js",
-	typescript: "js",
+const LANGUAGE_MAP: Record<string, EvalLanguage> = {
+	PY: "python",
+	PYTHON: "python",
+	IPY: "python",
+	IPYTHON: "python",
+	JS: "js",
+	JAVASCRIPT: "js",
+	TS: "js",
+	TYPESCRIPT: "js",
 };
 
-function resolveLanguageAlias(token: string): EvalLanguage | undefined {
-	return LANGUAGE_ALIASES[token.toLowerCase()];
-}
+// Markers are case-insensitive, accept ≥2 leading stars (so `**Cell` and
+// `*** Cell` both work), and tolerate any whitespace (including tabs)
+// between tokens. Models that can't constrain-sample frequently emit minor
+// variations like `**End` or `*** cell py`.
+const STARS = String.raw`\*{2,}`;
+// Cell header: `*** Cell <attrs...>`. The remainder of the line is captured
+// and tokenized separately so we can handle quoted values.
+const CELL_RE = new RegExp(`^${STARS}\\s*Cell\\b\\s*(.*)$`, "i");
+// `*** End` is a tolerated cell/file terminator. Documented as required at
+// the file level in the lark grammar (the trailing `*** End` quirks GPT-
+// trained models naturally produce), but optional at the parser level.
+const END_RE = new RegExp(`^${STARS}\\s*End\\b.*$`, "i");
+// `*** Abort` is the harmony-leak recovery sentinel; see ABORT_WARNING.
+const ABORT_RE = new RegExp(`^${STARS}\\s*Abort\\s*$`, "i");
 
 /**
- * Map an attribute key (from `key:value` or bare `key` in a header) to one
- * of the three canonical roles. Canonical keys: `id`, `t`, `rst`. Fallback
- * aliases — accepted but not advertised in the prompt — cover common
- * synonyms the LLM is likely to reach for instead of the short canonical.
+ * Warning text appended to the eval tool result when parsing terminated on
+ * `*** Abort`. Tells the model that earlier cells (if any) ran normally and
+ * that any aborted cell needs to be re-issued.
  */
-const ID_KEYS = new Set(["id", "title", "name", "cell", "file", "label"]);
-const T_KEYS = new Set(["t", "timeout", "duration", "time"]);
-const RST_KEYS = new Set(["rst", "reset"]);
+export const ABORT_WARNING =
+	"Tool stream truncated mid-call due to detected output corruption. Earlier cells (if any) executed normally; their state persists. Re-issue the aborted cell.";
 
-function classifyAttrKey(key: string): "id" | "t" | "rst" | null {
-	if (ID_KEYS.has(key)) return "id";
-	if (T_KEYS.has(key)) return "t";
-	if (RST_KEYS.has(key)) return "rst";
-	return null;
+const DURATION_RE = /^(\d+)(ms|s|m)?$/i;
+
+function resolveLang(token: string | undefined): EvalLanguage | undefined {
+	return token ? LANGUAGE_MAP[token.toUpperCase()] : undefined;
 }
-
-interface HeaderInfo {
-	language?: EvalLanguage;
-	title?: string;
-	timeoutMs?: number;
-	reset?: boolean;
-}
-
-/**
- * Match a header line: `={5,} <info>? ={5,}`. Both bars MUST be on the
- * same line and each MUST be at least five equal signs (lengths need not
- * match — a 5/6 split is fine).
- */
-const HEADER_RE = /^={5,}([^=].*?)?={5,}\s*$/;
-const EMPTY_HEADER_RE = /^={5,}\s*$/;
-
-const ATTR_TOKEN_RE = /^([a-zA-Z][\w-]*)(?::(?:"([^"]*)"|'([^']*)'|(.*)))?$/;
-const DURATION_TOKEN_RE = /^\d+(?:ms|s|m)?$/;
 
 function parseDurationMs(raw: string, lineNumber: number): number {
-	const match = /^(\d+)(ms|s|m)?$/.exec(raw.trim());
+	const match = DURATION_RE.exec(raw.trim());
 	if (!match) {
 		throw new Error(
 			`Eval line ${lineNumber}: invalid duration \`${raw}\`; use a number with optional ms, s, or m units.`,
 		);
 	}
 	const value = Number.parseInt(match[1], 10);
-	const unit = match[2] ?? "s";
+	const unit = (match[2] ?? "s").toLowerCase();
 	if (unit === "ms") return value;
 	if (unit === "s") return value * 1000;
 	return value * 60_000;
 }
 
-function parseBoolean(value: string): boolean | undefined {
-	const normalized = value.trim().toLowerCase();
-	if (normalized === "true" || normalized === "1" || normalized === "yes" || normalized === "on") return true;
-	if (normalized === "false" || normalized === "0" || normalized === "no" || normalized === "off") return false;
-	return undefined;
-}
+// Markdown fence wrapping a single bare cell, e.g. "```py\n...\n```" or
+// "```\n...\n```". Used by models that wrap eval input in code fences.
+const FENCE_OPEN_RE = /^```\s*([A-Za-z]\w*)?\s*$/;
+const FENCE_CLOSE_RE = /^```\s*$/;
 
-function trimOuterBlankLines(lines: string[]): string[] {
-	let start = 0;
-	let end = lines.length;
-	while (start < end && lines[start].trim() === "") start++;
-	while (end > start && lines[end - 1].trim() === "") end--;
-	return lines.slice(start, end);
+/**
+ * Last-resort fallback when the input has no recognizable `*** Cell` header.
+ * Models that can't constrain-sample sometimes pass bare code or wrap it in
+ * a markdown fence (```py / ```python / bare ```). Treat the whole input as
+ * a single implicit cell, sniffing the language from the body.
+ */
+function parseImplicitCell(lines: string[]): ParsedEvalCell {
+	let body = lines.slice();
+	while (body.length > 0 && body[0].trim() === "") body.shift();
+	while (body.length > 0 && body[body.length - 1].trim() === "") body.pop();
+
+	let fenceLang: string | undefined;
+	if (body.length >= 2) {
+		const open = FENCE_OPEN_RE.exec(body[0]);
+		const closeIdx = body.length - 1;
+		if (open && FENCE_CLOSE_RE.test(body[closeIdx])) {
+			fenceLang = open[1];
+			body = body.slice(1, closeIdx);
+		}
+	}
+
+	const code = body.join("\n");
+	const explicitLanguage = resolveLang(fenceLang);
+	const language = explicitLanguage ?? sniffEvalLanguage(code) ?? DEFAULT_LANGUAGE;
+	return {
+		index: 0,
+		title: undefined,
+		code,
+		language,
+		languageOrigin: explicitLanguage ? "header" : "default",
+		timeoutMs: DEFAULT_TIMEOUT_MS,
+		reset: false,
+	};
 }
 
 /**
- * Detect whether a line is a cell header. Returns the info string between
- * the two bar runs (trimmed) when it is, or `null` otherwise. An empty
- * header (`===== =====` or just `=====`) yields an empty info string.
- *
- * A line that contains text but only one bar (e.g. `===== title`) is NOT
- * a header — it's normal code that happens to start with equal signs.
+ * Tokenize a `*** Cell` header's attribute list while preserving quoted
+ * segments (`id:"some title"`, `py:"hi"`, single quotes too) as single
+ * tokens. Outer whitespace separates tokens; the quote characters
+ * themselves are kept verbatim so attribute parsing can strip them later.
  */
-function parseHeaderLine(line: string): string | null {
-	if (EMPTY_HEADER_RE.test(line)) return "";
-	const match = HEADER_RE.exec(line);
-	if (!match) return null;
-	return (match[1] ?? "").trim();
-}
-
-/**
- * Tokenize a header info string while preserving content inside matching
- * single or double quotes as a single token. The opening and closing
- * quote characters are kept verbatim so attribute parsing can strip them
- * later.
- */
-function tokenizeInfoString(info: string): string[] {
+function tokenizeCellAttrs(input: string): string[] {
 	const tokens: string[] = [];
 	let i = 0;
-	while (i < info.length) {
-		while (i < info.length && /\s/.test(info[i])) i++;
-		if (i >= info.length) break;
+	while (i < input.length) {
+		while (i < input.length && /\s/.test(input[i])) i++;
+		if (i >= input.length) break;
 		let token = "";
-		while (i < info.length && !/\s/.test(info[i])) {
-			const ch = info[i];
+		while (i < input.length && !/\s/.test(input[i])) {
+			const ch = input[i];
 			if (ch === '"' || ch === "'") {
 				token += ch;
 				i++;
-				while (i < info.length && info[i] !== ch) {
-					token += info[i];
+				while (i < input.length && input[i] !== ch) {
+					token += input[i];
 					i++;
 				}
-				if (i < info.length) {
-					token += info[i];
+				if (i < input.length) {
+					token += input[i];
 					i++;
 				}
 			} else {
@@ -155,31 +162,68 @@ function tokenizeInfoString(info: string): string[] {
 	return tokens;
 }
 
+interface CellHeader {
+	language: EvalLanguage | undefined;
+	languageOrigin: EvalLanguageOrigin;
+	title: string | undefined;
+	timeoutMs: number | undefined;
+	reset: boolean;
+}
+
 /**
- * Decode a header info string into language, title, timeout, and reset flag.
+ * Map an attribute key (from `key:value` or bare `key`) to one of the three
+ * canonical roles. Canonical keys: `id`, `t`, `rst`. Fallback aliases —
+ * accepted but not advertised in the prompt — cover common synonyms LLMs
+ * reach for instead of the short canonical.
+ */
+const ID_KEYS = new Set(["id", "title", "name", "cell", "file", "label"]);
+const T_KEYS = new Set(["t", "timeout", "duration", "time"]);
+const RST_KEYS = new Set(["rst", "reset"]);
+
+function classifyAttrKey(key: string): "id" | "t" | "rst" | null {
+	if (ID_KEYS.has(key)) return "id";
+	if (T_KEYS.has(key)) return "t";
+	if (RST_KEYS.has(key)) return "rst";
+	return null;
+}
+
+// `key:value` form. `value` may be `"..."`, `'...'`, or a bare run.
+const ATTR_TOKEN_RE = /^([a-zA-Z][\w-]*)(?::(?:"([^"]*)"|'([^']*)'|(.*)))?$/;
+// Bare positional duration (lenient — `t:` is canonical).
+const DURATION_TOKEN_RE = /^\d+(?:ms|s|m)?$/;
+
+function parseBooleanFlag(value: string): boolean | undefined {
+	const v = value.trim().toLowerCase();
+	if (v === "true" || v === "1" || v === "yes" || v === "on") return true;
+	if (v === "false" || v === "0" || v === "no" || v === "off") return false;
+	return undefined;
+}
+
+/**
+ * Decode a `*** Cell` header's attribute list into language, title,
+ * timeout, and reset flag.
  *
  * Token forms (all optional, any order):
- *   - `py` / `js` / `ts`              bare language
- *   - `py:"..."` / `js:"..."` / `ts:"..."`  language + title shorthand
- *   - `id:"..."`                      cell title
- *   - `t:<duration>`                  per-cell timeout
- *   - `<duration>`                    bare positional duration (lenient)
- *   - `rst`                           reset flag
- *   - `rst:true|false`                reset flag with explicit value
+ *   - `py` / `js` / `ts`                       bare language
+ *   - `py:"..."` / `js:"..."` / `ts:"..."`     language + title shorthand
+ *   - `id:"..."`                               cell title (canonical)
+ *   - `t:<duration>`                           per-cell timeout (canonical)
+ *   - `<duration>` (e.g. `30s`)                bare positional duration
+ *   - `rst`                                    reset flag (canonical)
+ *   - `rst:true|false|1|0|yes|no|on|off`       reset flag with explicit value
  *
  * Fallback aliases (accepted but not advertised in the prompt):
  *   - id:  title, name, cell, file, label
  *   - t:   timeout, duration, time
  *   - rst: reset
  *
- * Truly unknown keys are silently dropped. First occurrence wins when a
- * key is repeated (canonical or alias). Anything that doesn't classify
- * accumulates as a positional title fragment joined by spaces.
+ * Quotes may be `"` or `'`. Truly unknown keys are silently dropped. First
+ * occurrence wins when a key is repeated (canonical or alias). Anything
+ * that doesn't classify accumulates as a positional title fragment joined
+ * by spaces.
  */
-function parseHeaderInfo(info: string, lineNumber: number): HeaderInfo {
-	const tokens = tokenizeInfoString(info);
-	if (tokens.length === 0) return {};
-
+function parseCellHeader(rest: string, lineNumber: number): CellHeader {
+	const tokens = tokenizeCellAttrs(rest);
 	let language: EvalLanguage | undefined;
 	let titleAttr: string | undefined;
 	let positionalDurationMs: number | undefined;
@@ -189,7 +233,7 @@ function parseHeaderInfo(info: string, lineNumber: number): HeaderInfo {
 	const titleParts: string[] = [];
 
 	for (const token of tokens) {
-		// Bare reset flag.
+		// Bare reset flag (canonical or alias).
 		if (RST_KEYS.has(token.toLowerCase())) {
 			bareReset = true;
 			continue;
@@ -200,8 +244,8 @@ function parseHeaderInfo(info: string, lineNumber: number): HeaderInfo {
 			const key = attrMatch[1].toLowerCase();
 			const value = attrMatch[2] ?? attrMatch[3] ?? attrMatch[4] ?? "";
 
-			// Language-with-title shorthand: `py:"foo"` etc.
-			const langCandidate = resolveLanguageAlias(key);
+			// Language-with-title shorthand: `py:"foo"`, `js:'bar'`, etc.
+			const langCandidate = resolveLang(key);
 			if (langCandidate) {
 				if (language === undefined) language = langCandidate;
 				if (titleAttr === undefined && value !== "") titleAttr = value;
@@ -217,7 +261,7 @@ function parseHeaderInfo(info: string, lineNumber: number): HeaderInfo {
 		}
 
 		// Bare language token (no colon).
-		const lang = resolveLanguageAlias(token);
+		const lang = resolveLang(token);
 		if (lang && language === undefined) {
 			language = lang;
 			continue;
@@ -243,9 +287,9 @@ function parseHeaderInfo(info: string, lineNumber: number): HeaderInfo {
 		timeoutMs = positionalDurationMs;
 	}
 
-	let reset: boolean | undefined;
+	let reset = false;
 	if (rstAttr !== undefined) {
-		const parsed = parseBoolean(rstAttr);
+		const parsed = parseBooleanFlag(rstAttr);
 		if (parsed === undefined) {
 			throw new Error(`Eval line ${lineNumber}: invalid rst value \`${rstAttr}\`; use true or false.`);
 		}
@@ -254,84 +298,110 @@ function parseHeaderInfo(info: string, lineNumber: number): HeaderInfo {
 		reset = true;
 	}
 
-	return { language, title, timeoutMs, reset };
-}
-
-interface ExpansionState {
-	language: EvalLanguage;
-	languageOrigin: EvalLanguageOrigin;
+	return {
+		language,
+		languageOrigin: language ? "header" : "default",
+		title,
+		timeoutMs,
+		reset,
+	};
 }
 
 export function parseEvalInput(input: string): ParsedEvalInput {
 	const normalized = input.replace(/\r\n?/g, "\n");
 	const lines = normalized.split("\n");
-	// `split("\n")` produces a trailing empty element when the input ends with
-	// a newline. Drop it so we don't emit phantom blank trailing code lines.
 	if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
 
-	const state: ExpansionState = { language: "python", languageOrigin: "default" };
 	const cells: ParsedEvalCell[] = [];
+	let aborted = false;
 	let i = 0;
 
-	// Lenient: leading content before any header forms an implicit
-	// default-language cell. Drop it if it's only blank lines.
-	if (i < lines.length && parseHeaderLine(lines[i]) === null) {
-		const buffer: string[] = [];
-		while (i < lines.length && parseHeaderLine(lines[i]) === null) {
-			buffer.push(lines[i]);
-			i++;
+	// Skip leading blank lines.
+	while (i < lines.length && lines[i].trim() === "") i++;
+
+	// Lenient fallback: if the input has no recognizable cell header, treat
+	// the entire input as one implicit cell — unless that content contains
+	// `*** Abort`, in which case the body is incomplete/unsafe and we drop it.
+	if (i < lines.length && !CELL_RE.test(lines[i])) {
+		const tail = lines.slice(i);
+		if (tail.some(line => ABORT_RE.test(line))) {
+			return { cells, aborted: true };
 		}
-		const trimmed = trimOuterBlankLines(buffer);
-		if (trimmed.length > 0) {
-			cells.push({
-				index: cells.length,
-				title: undefined,
-				code: trimmed.join("\n"),
-				language: state.language,
-				languageOrigin: state.languageOrigin,
-				timeoutMs: DEFAULT_TIMEOUT_MS,
-				reset: false,
-			});
-		}
+		const cell = parseImplicitCell(tail);
+		if (cell.code.length > 0) cells.push(cell);
+		return { cells };
 	}
 
 	while (i < lines.length) {
-		const headerInfo = parseHeaderLine(lines[i]);
-		if (headerInfo === null) {
-			// Loop invariant guarantees this is a header line; guard anyway.
+		const headerLine = lines[i];
+		const cellMatch = CELL_RE.exec(headerLine);
+		if (!cellMatch) {
+			// Stray content between/after cells (blank lines were already
+			// consumed). `*** Abort` here terminates parsing; `*** End` is
+			// the optional file-level terminator (silently consumed). Anything
+			// else — typically a harmony-leak fragment — is skipped.
+			if (ABORT_RE.test(headerLine)) {
+				aborted = true;
+				break;
+			}
 			i++;
 			continue;
 		}
-		const headerLineNumber = i + 1;
-		const info = parseHeaderInfo(headerInfo, headerLineNumber);
-		i++; // consume header line
+		const header = parseCellHeader(cellMatch[1] ?? "", i + 1);
+		i++;
 
+		// Collect cell body. Close on `*** End` (any form), the next
+		// `*** Cell` header, or `*** Abort` (which drops the in-progress
+		// cell as its body is partial and unsafe to run).
 		const codeLines: string[] = [];
-		while (i < lines.length && parseHeaderLine(lines[i]) === null) {
-			codeLines.push(lines[i]);
+		let cellAborted = false;
+		while (i < lines.length) {
+			const line = lines[i];
+			if (ABORT_RE.test(line)) {
+				cellAborted = true;
+				aborted = true;
+				i++;
+				break;
+			}
+			if (END_RE.test(line)) {
+				i++;
+				break;
+			}
+			if (CELL_RE.test(line)) break;
+			codeLines.push(line);
 			i++;
 		}
+
+		if (cellAborted) break;
+
 		// Strip trailing blank lines so visual spacing between cells doesn't
 		// leak into the preceding cell's code.
 		while (codeLines.length > 0 && codeLines[codeLines.length - 1].trim() === "") {
 			codeLines.pop();
 		}
+		const code = codeLines.join("\n");
 
-		const language = info.language ?? state.language;
-		const languageOrigin: EvalLanguageOrigin = info.language ? "header" : state.languageOrigin;
+		const language = header.language ?? sniffEvalLanguage(code) ?? DEFAULT_LANGUAGE;
+		const languageOrigin: EvalLanguageOrigin = header.language ? "header" : "default";
 
 		cells.push({
 			index: cells.length,
-			title: info.title,
-			code: codeLines.join("\n"),
+			title: header.title,
+			code,
 			language,
 			languageOrigin,
-			timeoutMs: info.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-			reset: info.reset ?? false,
+			timeoutMs: header.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+			reset: header.reset,
 		});
-		state.language = language;
-		state.languageOrigin = languageOrigin;
+
+		// Skip blank separator lines between cells; an `*** Abort` here
+		// terminates parsing while keeping previously-collected cells.
+		while (i < lines.length && lines[i].trim() === "") i++;
+		if (i < lines.length && ABORT_RE.test(lines[i])) {
+			aborted = true;
+			break;
+		}
 	}
 
-	return { cells };
+	return aborted ? { cells, aborted: true } : { cells };
 }
