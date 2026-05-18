@@ -131,6 +131,7 @@ export class ProcessTerminal implements Terminal {
 	#osc11PollTimer?: Timer;
 	#mode2031DebounceTimer?: Timer;
 	#progressTimer?: ReturnType<typeof setInterval>;
+	#osc11ReceivedOnce = false;
 
 	get kittyProtocolActive(): boolean {
 		return this.#kittyProtocolActive;
@@ -391,9 +392,16 @@ export class ProcessTerminal implements Terminal {
 	#startOsc11Query(): void {
 		this.#osc11Pending = true;
 		this.#osc11ResponseBuffer = "";
-		this.#pendingDa1Sentinels++;
+		if (!this.#osc11ReceivedOnce) {
+			// DA1 sentinel: terminals process sequences in order, so if DA1
+			// arrives before OSC 11 response, the terminal does not support
+			// OSC 11. This avoids indefinite hangs (used by Neovim, bat, fish).
+			// Only needed on the first query — once we've received a response,
+			// further polling doesn't need the sentinel.
+			this.#pendingDa1Sentinels++;
+			this.#safeWrite("\x1b[c"); // DA1 sentinel
+		}
 		this.#safeWrite("\x1b]11;?\x07"); // OSC 11 query (BEL terminated)
-		this.#safeWrite("\x1b[c"); // DA1 sentinel
 	}
 	/**
 	 * Parse an OSC 11 background color response and compute BT.601 luminance.
@@ -407,6 +415,7 @@ export class ProcessTerminal implements Terminal {
 			return max > 0 ? value / max : 0;
 		};
 		const luminance = 0.299 * normalize(rHex) + 0.587 * normalize(gHex) + 0.114 * normalize(bHex);
+		this.#osc11ReceivedOnce = true;
 		const mode: TerminalAppearance = luminance < 0.5 ? "dark" : "light";
 		if (mode === this.#appearance) return;
 		this.#appearance = mode;
@@ -431,7 +440,7 @@ export class ProcessTerminal implements Terminal {
 				return;
 			}
 			this.#queryBackgroundColor();
-		}, 2_000);
+		}, 30_000);
 		this.#osc11PollTimer.unref();
 	}
 

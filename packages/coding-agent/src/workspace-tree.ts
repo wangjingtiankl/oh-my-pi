@@ -1,3 +1,5 @@
+import type { Dirent } from "node:fs";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { FileType, type GlobMatch, listWorkspace } from "@oh-my-pi/pi-natives";
 import { formatAge, formatBytes } from "@oh-my-pi/pi-utils";
@@ -59,17 +61,23 @@ export async function buildDirectoryTree(cwd: string, options: BuildDirectoryTre
 
 	let entries: readonly GlobMatch[];
 	let nativeTruncated: boolean;
-	try {
-		const result = await listWorkspace({
-			path: rootPath,
-			maxDepth,
-			hidden: true,
-			gitignore: false,
-		});
-		entries = result.entries;
-		nativeTruncated = result.truncated;
-	} catch {
-		return emptyTree(rootPath);
+	if (typeof listWorkspace !== "function") {
+		entries = await fallbackListDirectory(rootPath, maxDepth);
+		nativeTruncated = false;
+	} else {
+		try {
+			const result = await listWorkspace({
+				path: rootPath,
+				maxDepth,
+				hidden: true,
+				gitignore: false,
+			});
+			entries = result.entries;
+			nativeTruncated = result.truncated;
+		} catch {
+			entries = await fallbackListDirectory(rootPath, maxDepth);
+			nativeTruncated = false;
+		}
 	}
 
 	return assembleTree(rootPath, entries, {
@@ -78,6 +86,50 @@ export async function buildDirectoryTree(cwd: string, options: BuildDirectoryTre
 		lineCap: options.lineCap === undefined ? null : options.lineCap,
 		nativeTruncated,
 	});
+}
+
+/**
+ *
+ * Fallback directory listing using Node.js APIs when the native listWorkspace
+ * is unavailable or fails. Walks up to `maxDepth` levels, respecting hidden
+ * entries (no gitignore or excluded-dir filtering).
+ */
+async function fallbackListDirectory(rootPath: string, maxDepth: number): Promise<GlobMatch[]> {
+	const entries: GlobMatch[] = [];
+	async function walk(dir: string, relPath: string, depth: number): Promise<void> {
+		if (depth > maxDepth) return;
+		let dirEntries: Dirent[];
+		try {
+			dirEntries = await fs.readdir(dir, { withFileTypes: true });
+		} catch {
+			return;
+		}
+		for (const entry of dirEntries) {
+			const name = entry.name;
+			const entryRel = relPath ? `${relPath}/${name}` : name;
+			const isDir = entry.isDirectory();
+			let mtime: number | undefined;
+			let size: number | undefined;
+			try {
+				const stat = await fs.stat(path.join(dir, name));
+				mtime = stat.mtimeMs;
+				if (!isDir) size = stat.size;
+			} catch {
+				// stat can fail for symlinks or permission issues
+			}
+			entries.push({
+				path: entryRel,
+				fileType: isDir ? 2 : entry.isSymbolicLink() ? 3 : 1,
+				mtime,
+				size,
+			});
+			if (isDir) {
+				await walk(path.join(dir, name), entryRel, depth + 1);
+			}
+		}
+	}
+	await walk(rootPath, "", 0);
+	return entries;
 }
 
 /**

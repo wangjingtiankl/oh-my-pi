@@ -254,6 +254,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 	#pasteMode: boolean = false;
 	#pasteBuffer: string = "";
 	#pendingKittyPrintableCodepoint: number | undefined;
+	#partialEscape?: string;
 
 	constructor(options: StdinBufferOptions = {}) {
 		super();
@@ -284,6 +285,31 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		if (str.length === 0 && this.#buffer.length === 0) {
 			this.#emitDataSequence("");
 			return;
+		}
+		// Reassemble split escape sequences: if a previous flush() discarded an
+		// incomplete escape, try to complete it with the current data.
+		if (this.#partialEscape) {
+			if (str.startsWith(ESC)) {
+				// A new escape sequence started — the old partial is genuinely lost.
+				this.#partialEscape = undefined;
+			} else {
+				const combined = this.#partialEscape + str;
+				const status = isCompleteSequence(combined);
+				if (status === "complete") {
+					// The tail arrived — replace str with the completed sequence
+					// so extractCompleteSequences below emits it properly.
+					str = combined;
+					this.#partialEscape = undefined;
+				} else if (status === "incomplete") {
+					// Still waiting for more of this sequence — keep buffering
+					this.#partialEscape = combined;
+					return;
+				} else {
+					// "not-escape" — shouldn't happen since combined starts with ESC,
+					// but discard the partial and process the new data normally.
+					this.#partialEscape = undefined;
+				}
+			}
 		}
 
 		this.#buffer += str;
@@ -384,12 +410,11 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		}
 
 		// If the buffer contains a partial escape sequence (starts with ESC, >1 byte,
-		// not a complete sequence), discard it rather than emitting it as a "complete"
-		// sequence.  This prevents split terminal responses like
-		// "\x1b[?1;2;4;8;16" (DA1 response arriving in chunks) from having their
-		// remaining printable characters leak through to the input field.
+		// not a complete sequence), save it for reassembly rather than discarding.
+		// The next process() call may receive the tail to complete it.
 		// Single-byte ESC needs to be preserved as the Escape key.
 		if (this.#buffer.length > 1 && this.#buffer.startsWith(ESC) && isCompleteSequence(this.#buffer) !== "complete") {
+			this.#partialEscape = this.#buffer;
 			this.#buffer = "";
 			return [];
 		}
@@ -409,6 +434,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		this.#pasteMode = false;
 		this.#pasteBuffer = "";
 		this.#pendingKittyPrintableCodepoint = undefined;
+		this.#partialEscape = undefined;
 	}
 
 	getBuffer(): string {

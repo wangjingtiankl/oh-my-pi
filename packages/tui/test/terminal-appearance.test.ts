@@ -176,20 +176,21 @@ describe("ProcessTerminal OSC 11 appearance detection", () => {
 
 		const afterInitial = queryCount();
 
-		// Advance 2s — poll should fire and send another query
-		vi.advanceTimersByTime(2000);
+		// Advance 30s — poll should fire and send another query (no DA1 sentinel
+		// since OSC 11 was already received on the first query)
+		vi.advanceTimersByTime(30000);
 		expect(queryCount()).toBe(afterInitial + 1);
 
-		// Complete poll's OSC 11 + DA1
+		// Complete poll's OSC 11 (DA1 not sent — OSC 11 already confirmed)
 		process.stdin.emit("data", "\x1b]11;rgb:ffff/ffff/ffff\x07");
-		process.stdin.emit("data", "\x1b[?1;2c");
+		process.stdin.emit("data", "\x1b[?1;2c"); // stray DA1 reply (no sentinel — no-op)
 		// Send Mode 2031 notification — this activates push mode and stops polling
 		process.stdin.emit("data", "\x1b[?997;1n");
 		vi.advanceTimersByTime(100);
 
-		// Complete Mode 2031's re-query
+		// Complete Mode 2031's re-query (also no DA1)
 		process.stdin.emit("data", "\x1b]11;rgb:0000/0000/0000\x07");
-		process.stdin.emit("data", "\x1b[?1;2c");
+		process.stdin.emit("data", "\x1b[?1;2c"); // stray DA1 reply (no-op)
 
 		const afterMode2031 = queryCount();
 
@@ -255,16 +256,16 @@ describe("ProcessTerminal OSC 11 appearance detection", () => {
 		// Advance past debounce timer
 		vi.advanceTimersByTime(100);
 
-		// Step 4: Complete initial DA1 — should start queued query
+		// Step 4: Complete initial DA1 — starts queued query (no DA1 sentinel since OSC 11 already received in step 3)
 		process.stdin.emit("data", "\x1b[?1;2c");
 
 		expect(queryCount()).toBe(2);
-		expect(sentinelCount()).toBe(2);
+		expect(sentinelCount()).toBe(1);
 
 		// Step 5: Complete 2nd OSC 11 response with a different color (dark)
 		process.stdin.emit("data", "\x1b]11;rgb:0000/0000/0000\x07");
 
-		// Step 6: Complete 2nd DA1
+		// Step 6: Optional DA1 (not sent by 2nd query — no-op)
 		process.stdin.emit("data", "\x1b[?1;2c");
 
 		// Step 7: Verify appearance changed and callback fired
