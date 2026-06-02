@@ -1455,11 +1455,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		if (model?.provider === "cursor") {
 			toolRegistry.delete("edit");
 		}
-
-		const hasDeferrableTools = Array.from(toolRegistry.values()).some(tool => tool.deferrable === true);
-		if (!hasDeferrableTools) {
-			toolRegistry.delete("resolve");
-		} else if (!toolRegistry.has("resolve")) {
+		if (!toolRegistry.has("resolve")) {
 			const resolveTool = await logger.time("createTools:resolve:session", HIDDEN_TOOLS.resolve, toolSession);
 			if (resolveTool) {
 				toolRegistry.set(resolveTool.name, wrapToolWithMetaNotice(resolveTool));

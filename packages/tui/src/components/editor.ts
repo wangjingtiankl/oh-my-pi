@@ -1539,14 +1539,14 @@ export class Editor implements Component, Focusable {
 
 		// Check if we should trigger or update autocomplete
 		if (!this.#autocompleteState) {
+			const currentLine = this.#state.lines[this.#state.cursorLine] || "";
+			const textBeforeCursor = currentLine.slice(0, this.#state.cursorCol);
 			// Auto-trigger for "/" at the start of a line (slash commands)
 			if (char === "/" && this.#isAtStartOfSubmittedMessage()) {
 				this.#tryTriggerAutocomplete();
 			}
 			// Auto-trigger for "@" file reference (fuzzy search)
 			else if (char === "@") {
-				const currentLine = this.#state.lines[this.#state.cursorLine] || "";
-				const textBeforeCursor = currentLine.slice(0, this.#state.cursorCol);
 				// Only trigger if @ is after whitespace or at start of line
 				const charBeforeAt = textBeforeCursor[textBeforeCursor.length - 2];
 				if (textBeforeCursor.length === 1 || charBeforeAt === " " || charBeforeAt === "\t") {
@@ -1559,8 +1559,6 @@ export class Editor implements Component, Focusable {
 			}
 			// Also auto-trigger when typing letters/path chars in a completable context
 			else if (/[a-zA-Z0-9.\-_/]/.test(char)) {
-				const currentLine = this.#state.lines[this.#state.cursorLine] || "";
-				const textBeforeCursor = currentLine.slice(0, this.#state.cursorCol);
 				// Check if we're in a slash command (with or without space for arguments)
 				if (this.#isInSubmittedSlashCommandContext()) {
 					this.#tryTriggerAutocomplete();
@@ -1585,7 +1583,6 @@ export class Editor implements Component, Focusable {
 			// Check if we're in a :emoji shortcode context
 			else if (textBeforeCursor.match(/(?:^|[\s([{>]):[a-zA-Z0-9_+-]*$/)) {
 				this.#tryTriggerAutocomplete();
-			}
 			}
 		} else {
 			this.#debouncedUpdateAutocomplete();

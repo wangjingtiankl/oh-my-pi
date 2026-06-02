@@ -734,7 +734,6 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			const message = reason.trim();
 			if (message.length > 0) return message;
 		}
-		}
 		if (signal?.aborted) {
 			const reason = signal.reason;
 			if (reason instanceof Error) {
@@ -1064,7 +1063,11 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		let abortReasonText: string | undefined;
 		const checkAbort = () => {
 			if (abortSignal.aborted) {
-				aborted = abortReason === "signal" || runtimeLimitExceeded || abortReason === undefined || abortReason === "terminate";
+				aborted =
+					abortReason === "signal" ||
+					runtimeLimitExceeded ||
+					abortReason === undefined ||
+					abortReason === "terminate";
 				if (aborted) {
 					abortReasonText ??= runtimeLimitExceeded ? resolveAbortReasonText() : resolveAbortReason();
 				}
@@ -1364,7 +1367,11 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			const lastAssistant = session.getLastAssistantMessage();
 			if (lastAssistant) {
 				if (lastAssistant.stopReason === "aborted") {
-					aborted = abortReason === "signal" || runtimeLimitExceeded || abortReason === undefined || abortReason === "terminate";
+					aborted =
+						abortReason === "signal" ||
+						runtimeLimitExceeded ||
+						abortReason === undefined ||
+						abortReason === "terminate";
 					if (aborted) {
 						abortReasonText ??= runtimeLimitExceeded ? resolveAbortReasonText() : resolveAbortReason();
 					}
@@ -1381,7 +1388,11 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			}
 		} finally {
 			if (abortSignal.aborted) {
-				aborted = abortReason === "signal" || runtimeLimitExceeded || abortReason === undefined || abortReason === "terminate";
+				aborted =
+					abortReason === "signal" ||
+					runtimeLimitExceeded ||
+					abortReason === undefined ||
+					abortReason === "terminate";
 				if (aborted) {
 					abortReasonText ??= runtimeLimitExceeded ? resolveAbortReasonText() : resolveAbortReason();
 				}
@@ -1498,7 +1509,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			? resolveAbortReasonText()
 			: abortedViaYield
 				? yieldAbortReason
-				: (done.abortReason ?? (signal?.aborted ? resolveSignalAbortReason() : (resolveAbortReason() ?? "Subagent aborted task")))
+				: (done.abortReason ??
+					(signal?.aborted ? resolveSignalAbortReason() : (resolveAbortReason() ?? "Subagent aborted task")))
 		: undefined;
 	progress.status = wasAborted ? "aborted" : exitCode === 0 ? "completed" : "failed";
 	scheduleProgress(true);
